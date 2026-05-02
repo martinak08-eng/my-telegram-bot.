@@ -1,40 +1,38 @@
 import os
-import requests, time, threading, hashlib, json as _json
+import requests
+import time
+import threading
+import hashlib
+import json as _json
 from datetime import datetime
 from flask import Flask
 from threading import Thread
 
-# ================= CONFIG =================
+# ================= CONFIG (Береться з Railway Variables) =================
 
-# 1. ВСТАВТЕ ВАШ ТОКЕН ТА ID ТУТ:
-TELEGRAM_TOKEN = "8694956837:AAEo0thSc3rdboV40YQHW6L7_JcgyjJbH2E"
-CHAT_ID = "5903555117"
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
+CHAT_ID = os.environ.get("CHAT_ID")
 
-# 2. НАЛАШТУВАННЯ ПРОКСІ (Обов'язково для PythonAnywhere)
-PROXY_URL = "http://proxy.server:3128"
-proxies = {
-    "http": PROXY_URL,
-    "https": PROXY_URL,
-}
+# Проксі для Railway НЕ потрібні, тому ми їх видаляємо з налаштувань requests
 
-# ================= KEEP ALIVE =================
+# ================= KEEP ALIVE (Для моніторингу) =================
 app = Flask('')
+
 @app.route('/')
 def home():
     return "Bot is running"
 
 def run_web():
-    # На PythonAnywhere порт ігнорується у Flask, але для коду залишимо
-    app.run(host='0.0.0.0', port=8080)
+    # Railway автоматично призначає PORT, беремо його або ставимо 8080 за замовчуванням
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host='0.0.0.0', port=port)
 
 def keep_alive():
     Thread(target=run_web, daemon=True).start()
 
 # ================= ENDPOINTS =================
-# Змінено на основні API, щоб проксі легше пропускав запити
 BNC_KLINES = "https://api.binance.com/api/v3/klines"
 BNC_TICKER_24H = "https://api.binance.com/api/v3/ticker/24hr"
-OKX_FUNDING = "https://www.okx.com/api/v5/public/funding-rate"
 
 # ================= SETTINGS =================
 MIN_VOLUME = 50000000
@@ -45,13 +43,12 @@ MIN_RR = 3
 COOLDOWN = {}
 COOLDOWN_TIME = 3600
 OPEN_TRADES = []
-STATS = {"win": 0, "loss": 0}
 SIGNAL_CACHE = {}
 SIGNAL_TTL = 7200
 LAST_SIGNAL_PER_SYMBOL = {}
 SIGNAL_REPEAT_BLOCK = 7200
 
-# ================= ANTI-DUPLICATE =================
+# ================= LOGIC =================
 def is_duplicate(symbol, side, entry, tp, sl):
     key = f"{symbol}_{side}_{round(entry,4)}_{round(tp,4)}_{round(sl,4)}"
     key = hashlib.md5(key.encode()).hexdigest()
@@ -73,24 +70,24 @@ def is_duplicate_advanced(symbol, side):
     LAST_SIGNAL_PER_SYMBOL[symbol] = (now, side)
     return False
 
-# ================= TELEGRAM =================
+# ================= TELEGRAM (Без проксі) =================
 def send(msg):
+    if not TELEGRAM_TOKEN or not CHAT_ID:
+        print("Помилка: TELEGRAM_TOKEN або CHAT_ID не встановлені в Variables!")
+        return
     try:
-        # Додано proxies=proxies
         requests.post(
             f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
             data={"chat_id": CHAT_ID, "text": msg},
-            proxies=proxies,
             timeout=10
         )
     except Exception as e:
         print(f"Помилка Telegram: {e}")
 
-# ================= DATA =================
+# ================= DATA FETCHING (Без проксі) =================
 def safe_get(url, params=None):
     try:
-        # Додано proxies=proxies
-        r = requests.get(url, params=params, proxies=proxies, timeout=15)
+        r = requests.get(url, params=params, timeout=15)
         return r.json() if r.status_code == 200 else None
     except Exception as e:
         print(f"Помилка API ({url}): {e}")
@@ -99,8 +96,7 @@ def safe_get(url, params=None):
 def get_symbols():
     data = safe_get(BNC_TICKER_24H)
     coins = []
-    if not isinstance(data, list):
-        return []
+    if not isinstance(data, list): return []
     for c in data:
         try:
             if not c["symbol"].endswith("USDT"): continue
@@ -115,13 +111,7 @@ def get_symbols():
 def get_klines(symbol, tf="5m"):
     return safe_get(BNC_KLINES, {"symbol": symbol, "interval": tf, "limit": 120})
 
-# ================= LOGIC & STRATEGIES =================
-def is_strong_trend(closes):
-    if len(closes) < 20: return False
-    ma_fast = sum(closes[-10:]) / 10
-    ma_slow = sum(closes[-20:]) / 20
-    return abs(ma_fast - ma_slow) / ma_slow > 0.005
-
+# ================= STRATEGIES =================
 def build_signal(symbol, side, entry, tp, sl, impulse):
     try:
         rr = abs((tp - entry) / (entry - sl))
@@ -140,11 +130,13 @@ def smart_money(symbol):
     highs  = [float(x[2]) for x in k]
     lows   = [float(x[3]) for x in k]
     vol    = [float(x[5]) for x in k]
-    if not is_strong_trend(closes): return None
+    if len(closes) < 30: return None
+    
     price, ma = closes[-1], sum(closes[-30:]) / 30
     trend = "LONG" if price > ma else "SHORT"
-    impulse = (closes[-1] - closes[-5]) / closes[-5] * 100
+    impulse = (closes[-1] - closes[-5]) / (closes[-5] if closes[-5] != 0 else 1) * 100
     avg_vol = sum(vol[-20:]) / 20
+    
     if vol[-1] > avg_vol * 2:
         if trend == "LONG":
             sl = min(lows[-20:]); tp = price + (price - sl) * 3
@@ -152,6 +144,7 @@ def smart_money(symbol):
         else:
             sl = max(highs[-20:]); tp = price - (sl - price) * 3
             return build_signal(symbol, "SHORT", price, tp, sl, impulse)
+    return None
 
 def impulse_detector(symbol):
     k = get_klines(symbol, "5m")
@@ -159,15 +152,17 @@ def impulse_detector(symbol):
     closes = [float(x[4]) for x in k]
     vol = [float(x[5]) for x in k]
     price = closes[-1]
-    impulse = (closes[-1] - closes[-3]) / closes[-3] * 100
-    avg_vol = sum(vol[:-1]) / len(vol[:-1])
+    impulse = (closes[-1] - closes[-3]) / (closes[-3] if closes[-3] != 0 else 1) * 100
+    avg_vol = sum(vol[:-1]) / (len(vol[:-1]) if len(vol[:-1]) > 0 else 1)
+    
     if vol[-1] > avg_vol * 3 and abs(impulse) > MIN_IMPULSE:
         side = "LONG" if impulse > 0 else "SHORT"
         sl = price * (0.996 if side == "LONG" else 1.004)
         tp = price * (1.025 if side == "LONG" else 0.975)
         return build_signal(symbol, side, price, tp, sl, impulse)
+    return None
 
-# ================= TRACK =================
+# ================= MONITORING =================
 def track():
     while True:
         for t in OPEN_TRADES[:]:
@@ -184,7 +179,7 @@ def track():
 
 # ================= MAIN =================
 def run():
-    send("🚀 BOT STARTED ON PYTHONANYWHERE")
+    send("🚀 BOT STARTED ON RAILWAY")
     while True:
         try:
             symbols = get_symbols()
@@ -201,6 +196,6 @@ def run():
         time.sleep(300)
 
 if __name__ == "__main__":
-    # На PythonAnywhere краще запускати track в окремому потоці, а run у головному
+    keep_alive() # Запуск веб-сервера для Railway
     threading.Thread(target=track, daemon=True).start()
     run()
