@@ -21,7 +21,6 @@ def home():
     return "Bot is alive and running!"
 
 def run_web():
-    # Railway призначає порт автоматично через змінну PORT
     port = int(os.environ.get("PORT", 8080))
     app.run(host='0.0.0.0', port=port)
 
@@ -37,19 +36,17 @@ MIN_VOLUME = 50000000
 MIN_IMPULSE = 3
 MIN_RR = 3
 
-# ================= STATE =================
+# ================= STATE & ANTI-SPAM =================
 COOLDOWN = {}
 COOLDOWN_TIME = 3600
 OPEN_TRADES = []
-SIGNAL_CACHE = {}
-SIGNAL_TTL = 7200
-LAST_SIGNAL_PER_SYMBOL = {}
-SIGNAL_REPEAT_BLOCK = 7200
+SIGNAL_CACHE = {}  # Для запобігання дублікатів
+SIGNAL_TTL = 7200  # Час життя кешу сигналу (2 години)
 
-# ================= TELEGRAM (БЕЗ ПРОКСІ) =================
+# ================= TELEGRAM =================
 def send(msg):
     if not TELEGRAM_TOKEN or not CHAT_ID:
-        print("Error: TELEGRAM_TOKEN or CHAT_ID is missing in Railway Variables!")
+        print("Помилка: TELEGRAM_TOKEN або CHAT_ID не знайдено в налаштуваннях!")
         return
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
@@ -57,7 +54,7 @@ def send(msg):
     except Exception as e:
         print(f"Telegram error: {e}")
 
-# ================= DATA =================
+# ================= DATA FETCHING =================
 def safe_get(url, params=None):
     try:
         r = requests.get(url, params=params, timeout=15)
@@ -84,19 +81,26 @@ def get_symbols():
 def get_klines(symbol, tf="5m"):
     return safe_get(BNC_KLINES, {"symbol": symbol, "interval": tf, "limit": 120})
 
-# ================= STRATEGIES =================
+# ================= LOGIC & FILTRATION =================
 def build_signal(symbol, side, entry, tp, sl, impulse):
     try:
         rr = abs((tp - entry) / (entry - sl))
     except: return None
+    
     if rr < MIN_RR or abs(impulse) < MIN_IMPULSE: return None
     
-    # Anti-duplicate checks
-    key = hashlib.md5(f"{symbol}_{side}_{round(entry,4)}".encode()).hexdigest()
-    if key in SIGNAL_CACHE: return None
-    SIGNAL_CACHE[key] = time.time()
+    # Створення унікального ключа сигналу для фільтрації спаму
+    signal_key = hashlib.md5(f"{symbol}_{side}_{round(entry, 2)}".encode()).hexdigest()
     
+    now = time.time()
+    # Якщо такий сигнал уже був надісланий нещодавно - ігноруємо
+    if signal_key in SIGNAL_CACHE:
+        if now - SIGNAL_CACHE[signal_key] < SIGNAL_TTL:
+            return None
+            
+    SIGNAL_CACHE[signal_key] = now
     OPEN_TRADES.append({"symbol": symbol, "side": side, "entry": entry, "tp": tp, "sl": sl})
+    
     return f"🔥 SIGNAL: {symbol} {side}\nEntry: {round(entry,4)}\nTP: {round(tp,4)}\nSL: {round(sl,4)}\nImpulse: {round(impulse,2)}%"
 
 def smart_money(symbol):
@@ -121,7 +125,7 @@ def smart_money(symbol):
             return build_signal(symbol, "SHORT", price, tp, sl, impulse)
     return None
 
-# ================= MAIN LOOP =================
+# ================= TRACKING & MONITORING =================
 def track():
     while True:
         for t in OPEN_TRADES[:]:
@@ -129,31 +133,36 @@ def track():
             if not k: continue
             price = float(k[-1][4])
             if (t["side"] == "LONG" and price >= t["tp"]) or (t["side"] == "SHORT" and price <= t["tp"]):
-                send(f"✅ TP {t['symbol']}")
+                send(f"✅ PROFIT: {t['symbol']}")
                 OPEN_TRADES.remove(t)
             elif (t["side"] == "LONG" and price <= t["sl"]) or (t["side"] == "SHORT" and price >= t["sl"]):
-                send(f"❌ SL {t['symbol']}")
+                send(f"❌ STOP LOSS: {t['symbol']}")
                 OPEN_TRADES.remove(t)
         time.sleep(30)
 
+# ================= MAIN RUN =================
 def run():
-    send("🚀 Бот запущений на Railway!")
+    # Повідомлення про запуск тільки один раз при старті скрипта
+    send("🚀 Бот успішно запущений та очікує сильних сигналів.")
+    
     while True:
         try:
             symbols = get_symbols()
             for s in symbols:
-                if s in COOLDOWN and time.time() - COOLDOWN[s] < COOLDOWN_TIME: continue
+                # Перевірка на внутрішній cooldown монети (1 година)
+                if s in COOLDOWN and time.time() - COOLDOWN[s] < COOLDOWN_TIME:
+                    continue
+                
                 sig = smart_money(s)
                 if sig:
                     send(sig)
                     COOLDOWN[s] = time.time()
-                    break
+                    break # Перехід до наступного циклу очікування
         except Exception as e:
             print(f"Main loop error: {e}")
         time.sleep(300)
 
 if __name__ == "__main__":
-    keep_alive()
+    keep_alive() # Запуск веб-сервера для Railway
     threading.Thread(target=track, daemon=True).start()
     run()
-
