@@ -13,17 +13,15 @@ from threading import Thread
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 CHAT_ID = os.environ.get("CHAT_ID")
 
-# Проксі для Railway НЕ потрібні, тому ми їх видаляємо з налаштувань requests
-
-# ================= KEEP ALIVE (Для моніторингу) =================
+# ================= KEEP ALIVE (Для Railway) =================
 app = Flask('')
 
 @app.route('/')
 def home():
-    return "Bot is running"
+    return "Bot is alive and running!"
 
 def run_web():
-    # Railway автоматично призначає PORT, беремо його або ставимо 8080 за замовчуванням
+    # Railway призначає порт автоматично через змінну PORT
     port = int(os.environ.get("PORT", 8080))
     app.run(host='0.0.0.0', port=port)
 
@@ -48,49 +46,24 @@ SIGNAL_TTL = 7200
 LAST_SIGNAL_PER_SYMBOL = {}
 SIGNAL_REPEAT_BLOCK = 7200
 
-# ================= LOGIC =================
-def is_duplicate(symbol, side, entry, tp, sl):
-    key = f"{symbol}_{side}_{round(entry,4)}_{round(tp,4)}_{round(sl,4)}"
-    key = hashlib.md5(key.encode()).hexdigest()
-    now = time.time()
-    for k in list(SIGNAL_CACHE.keys()):
-        if now - SIGNAL_CACHE[k] > SIGNAL_TTL:
-            del SIGNAL_CACHE[k]
-    if key in SIGNAL_CACHE:
-        return True
-    SIGNAL_CACHE[key] = now
-    return False
-
-def is_duplicate_advanced(symbol, side):
-    now = time.time()
-    if symbol in LAST_SIGNAL_PER_SYMBOL:
-        t, s = LAST_SIGNAL_PER_SYMBOL[symbol]
-        if now - t < SIGNAL_REPEAT_BLOCK and s == side:
-            return True
-    LAST_SIGNAL_PER_SYMBOL[symbol] = (now, side)
-    return False
-
-# ================= TELEGRAM (Без проксі) =================
+# ================= TELEGRAM (БЕЗ ПРОКСІ) =================
 def send(msg):
     if not TELEGRAM_TOKEN or not CHAT_ID:
-        print("Помилка: TELEGRAM_TOKEN або CHAT_ID не встановлені в Variables!")
+        print("Error: TELEGRAM_TOKEN or CHAT_ID is missing in Railway Variables!")
         return
     try:
-        requests.post(
-            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-            data={"chat_id": CHAT_ID, "text": msg},
-            timeout=10
-        )
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+        requests.post(url, data={"chat_id": CHAT_ID, "text": msg}, timeout=10)
     except Exception as e:
-        print(f"Помилка Telegram: {e}")
+        print(f"Telegram error: {e}")
 
-# ================= DATA FETCHING (Без проксі) =================
+# ================= DATA =================
 def safe_get(url, params=None):
     try:
         r = requests.get(url, params=params, timeout=15)
         return r.json() if r.status_code == 200 else None
     except Exception as e:
-        print(f"Помилка API ({url}): {e}")
+        print(f"API error ({url}): {e}")
         return None
 
 def get_symbols():
@@ -117,24 +90,26 @@ def build_signal(symbol, side, entry, tp, sl, impulse):
         rr = abs((tp - entry) / (entry - sl))
     except: return None
     if rr < MIN_RR or abs(impulse) < MIN_IMPULSE: return None
-    if is_duplicate(symbol, side, entry, tp, sl): return None
-    if is_duplicate_advanced(symbol, side): return None
+    
+    # Anti-duplicate checks
+    key = hashlib.md5(f"{symbol}_{side}_{round(entry,4)}".encode()).hexdigest()
+    if key in SIGNAL_CACHE: return None
+    SIGNAL_CACHE[key] = time.time()
     
     OPEN_TRADES.append({"symbol": symbol, "side": side, "entry": entry, "tp": tp, "sl": sl})
-    return f"🔥 SIGNAL\n{symbol} {side}\nEntry: {round(entry,4)}\nTP: {round(tp,4)}\nSL: {round(sl,4)}\nRR 1:{round(rr,2)}\nImpulse {round(impulse,2)}%"
+    return f"🔥 SIGNAL: {symbol} {side}\nEntry: {round(entry,4)}\nTP: {round(tp,4)}\nSL: {round(sl,4)}\nImpulse: {round(impulse,2)}%"
 
 def smart_money(symbol):
     k = get_klines(symbol, "15m")
-    if not k: return None
+    if not k or len(k) < 30: return None
     closes = [float(x[4]) for x in k]
-    highs  = [float(x[2]) for x in k]
-    lows   = [float(x[3]) for x in k]
-    vol    = [float(x[5]) for x in k]
-    if len(closes) < 30: return None
+    lows = [float(x[3]) for x in k]
+    highs = [float(x[2]) for x in k]
+    vol = [float(x[5]) for x in k]
     
     price, ma = closes[-1], sum(closes[-30:]) / 30
     trend = "LONG" if price > ma else "SHORT"
-    impulse = (closes[-1] - closes[-5]) / (closes[-5] if closes[-5] != 0 else 1) * 100
+    impulse = (closes[-1] - closes[-5]) / (closes[-5] or 1) * 100
     avg_vol = sum(vol[-20:]) / 20
     
     if vol[-1] > avg_vol * 2:
@@ -146,23 +121,7 @@ def smart_money(symbol):
             return build_signal(symbol, "SHORT", price, tp, sl, impulse)
     return None
 
-def impulse_detector(symbol):
-    k = get_klines(symbol, "5m")
-    if not k: return None
-    closes = [float(x[4]) for x in k]
-    vol = [float(x[5]) for x in k]
-    price = closes[-1]
-    impulse = (closes[-1] - closes[-3]) / (closes[-3] if closes[-3] != 0 else 1) * 100
-    avg_vol = sum(vol[:-1]) / (len(vol[:-1]) if len(vol[:-1]) > 0 else 1)
-    
-    if vol[-1] > avg_vol * 3 and abs(impulse) > MIN_IMPULSE:
-        side = "LONG" if impulse > 0 else "SHORT"
-        sl = price * (0.996 if side == "LONG" else 1.004)
-        tp = price * (1.025 if side == "LONG" else 0.975)
-        return build_signal(symbol, side, price, tp, sl, impulse)
-    return None
-
-# ================= MONITORING =================
+# ================= MAIN LOOP =================
 def track():
     while True:
         for t in OPEN_TRADES[:]:
@@ -177,25 +136,24 @@ def track():
                 OPEN_TRADES.remove(t)
         time.sleep(30)
 
-# ================= MAIN =================
 def run():
-    send("🚀 BOT STARTED ON RAILWAY")
+    send("🚀 Бот запущений на Railway!")
     while True:
         try:
             symbols = get_symbols()
             for s in symbols:
-                if s in COOLDOWN and time.time() - COOLDOWN[s] < COOLDOWN_TIME:
-                    continue
-                sig = smart_money(s) or impulse_detector(s)
+                if s in COOLDOWN and time.time() - COOLDOWN[s] < COOLDOWN_TIME: continue
+                sig = smart_money(s)
                 if sig:
                     send(sig)
                     COOLDOWN[s] = time.time()
                     break
         except Exception as e:
-            print(f"Помилка в основному циклі: {e}")
+            print(f"Main loop error: {e}")
         time.sleep(300)
 
 if __name__ == "__main__":
-    keep_alive() # Запуск веб-сервера для Railway
+    keep_alive()
     threading.Thread(target=track, daemon=True).start()
     run()
+
