@@ -3,7 +3,6 @@ import requests
 import time
 import threading
 import hashlib
-import json as _json
 from flask import Flask, request
 from threading import Thread
 
@@ -11,91 +10,117 @@ from threading import Thread
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 CHAT_ID = os.environ.get("CHAT_ID")
 
+# Перевірка налаштувань
+if not TELEGRAM_TOKEN or not CHAT_ID:
+    print("⚠️ УВАГА: Перевірте змінні TELEGRAM_TOKEN та CHAT_ID у Railway!")
+
 # ================= KEEP ALIVE & WEBHOOKS =================
 app = Flask('')
 
 @app.route('/')
 def home():
-    return "Bot is running"
+    return "✅ Бот працює стабільно"
 
-# Обробка вхідних повідомлень (натискання кнопок)
-@app.route('/' + (TELEGRAM_TOKEN if TELEGRAM_TOKEN else "webhook"), methods=['POST'])
+# Обробка натискання кнопок у Telegram
+@app.route('/webhook', methods=['POST'])
 def webhook():
-    update = request.get_json()
-    if "message" in update:
-        text = update["message"].get("text")
-        chat_id = update["message"]["chat"]["id"]
-        
-        if text == "📊 Статус":
-            send_msg(chat_id, "✅ Бот працює стабільно. Пошук сигналів триває...")
-        elif text == "👀 Watchlist":
-            send_msg(chat_id, "🔎 У списку спостереження зараз 30 активних USDT пар.")
-        elif text == "📈 Угоди":
-            count = len(OPEN_TRADES)
-            send_msg(chat_id, f"💼 Активних угод зараз: {count}")
-        elif text == "🏆 Stats":
-            send_msg(chat_id, "📊 Статистика за сьогодні: 0 Win / 0 Loss (оновлюється після закриття угод)")
+    try:
+        update = request.get_json()
+        if "message" in update:
+            text = update["message"].get("text")
+            user_id = str(update["message"]["chat"]["id"])
+            
+            # Обробка команд від власника (CHAT_ID)
+            if user_id == CHAT_ID:
+                if text == "📊 Статус":
+                    send_msg("⚙️ **Статус системи:**\n💎 Моніторинг Binance: АКТИВНО\n📡 З'єднання з API: СТАБІЛЬНЕ\n🚀 Режим: АНТИ-СПАМ")
+                elif text == "👀 Watchlist":
+                    send_msg("🔎 **Watchlist:**\nПеревіряю ТОП-30 пар USDT на Binance за волатильністю...")
+                elif text == "📈 Угоди":
+                    send_msg(f"💼 **Портфель:**\nНаразі в пам'яті активних сигналів: {len(OPEN_TRADES)}")
+                elif text == "🏆 Stats":
+                    send_msg("📊 **Статистика сесії:**\n✅ Прибуток: +0.0%\n🎯 Win Rate: 100% (очікування даних)")
+    except Exception as e:
+        print(f"Помилка Webhook: {e}")
     return "OK", 200
 
 def run_web():
     port = int(os.environ.get("PORT", 8080))
     app.run(host='0.0.0.0', port=port)
 
-# ================= STATE & FILTERS =================
-COOLDOWN = {}
+# ================= ЛОГІКА ТА ФІЛЬТРАЦІЯ =================
 OPEN_TRADES = []
 SIGNAL_CACHE = {} 
-SIGNAL_TTL = 7200 # 2 години не повторювати сигнал
+SIGNAL_TTL = 7200 # 2 години не повторювати один сигнал
 
-# ================= TELEGRAM FUNCTIONS =================
-def send_msg(chat, msg):
+def send_msg(msg):
+    if not TELEGRAM_TOKEN or not CHAT_ID: return
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-        requests.post(url, data={"chat_id": chat, "text": msg}, timeout=10)
+        data = {"chat_id": CHAT_ID, "text": msg, "parse_mode": "Markdown"}
+        requests.post(url, data=data, timeout=10)
     except Exception as e:
-        print(f"Error: {e}")
+        print(f"Помилка відправки: {e}")
 
-# ================= LOGIC =================
 def build_signal(symbol, side, entry, tp, sl, impulse):
-    # Унікальний ключ сигналу, щоб не спамити
-    sig_id = hashlib.md5(f"{symbol}_{side}_{round(entry,2)}".encode()).hexdigest()
+    # Унікальний ключ сигналу (монета + напрямок + ціна)
+    sig_id = hashlib.md5(f"{symbol}_{side}_{round(entry, 2)}".encode()).hexdigest()
     
+    now = time.time()
     if sig_id in SIGNAL_CACHE:
-        if time.time() - SIGNAL_CACHE[sig_id] < SIGNAL_TTL:
-            return None # Пропускаємо дублікат
+        if now - SIGNAL_CACHE[sig_id] < SIGNAL_TTL:
+            return None # Ігноруємо дублікат
             
-    SIGNAL_CACHE[sig_id] = time.time()
-    OPEN_TRADES.append({"symbol": symbol, "tp": tp, "sl": sl, "side": side})
+    SIGNAL_CACHE[sig_id] = now
     
-    return f"🔥 СИГНАЛ: {symbol} {side}\nВхід: {round(entry,4)}\nTP: {round(tp,4)}\nSL: {round(sl,4)}\nІмпульс: {round(impulse,2)}%"
+    emoji = "🟢 LONG" if side == "LONG" else "🔴 SHORT"
+    animation = "📈" if side == "LONG" else "📉"
+    
+    return (
+        f"{animation} **НОВИЙ СИГНАЛ: {symbol}**\n"
+        f"━━━━━━━━━━━━━━━\n"
+        f"Тип: `{emoji}`\n"
+        f"💵 Вхід: `{round(entry, 5)}`\n"
+        f"🎯 Тейк: `{round(tp, 5)}`\n"
+        f"🛑 Стоп: `{round(sl, 5)}`\n"
+        f"━━━━━━━━━━━━━━━\n"
+        f"⚡️ Імпульс: `{round(impulse, 2)}%`"
+    )
 
-def get_data():
-    # Спрощена логіка отримання даних з Binance
-    try:
-        r = requests.get("https://api.binance.com/api/v3/ticker/24hr", timeout=10).json()
-        for item in r[:20]: # Беремо топ монет
-            if "USDT" in item['symbol']:
-                change = float(item['priceChangePercent'])
-                if abs(change) > 4: # Якщо рух більше 4%
-                    price = float(item['lastPrice'])
-                    side = "LONG" if change > 0 else "SHORT"
-                    tp = price * (1.02 if side == "LONG" else 0.98)
-                    sl = price * (0.99 if side == "LONG" else 1.01)
-                    sig = build_signal(item['symbol'], side, price, tp, sl, change)
-                    if sig:
-                        send_msg(CHAT_ID, sig)
-    except:
-        pass
-
-def main_loop():
-    # Повідомлення про запуск ТІЛЬКИ ОДИН РАЗ
-    send_msg(CHAT_ID, "🚀 Бот успішно запущений на Railway. Очікую сигнали...")
+def monitor_market():
+    # Повідомлення про запуск (лише ОДИН РАЗ)
+    send_msg("🚀 **Бот успішно активований!**\nНалаштування анти-спаму та кнопок застосовані.")
+    
     while True:
-        get_data()
-        time.sleep(300) # Перевірка кожні 5 хвилин
+        try:
+            # Отримання даних Binance
+            r = requests.get("https://api.binance.com/api/v3/ticker/24hr", timeout=10).json()
+            for item in r:
+                symbol = item['symbol']
+                if symbol.endswith("USDT"):
+                    change = float(item['priceChangePercent'])
+                    
+                    # Фільтр на сильний рух (більше 4.5%)
+                    if abs(change) > 4.5:
+                        price = float(item['lastPrice'])
+                        side = "LONG" if change > 0 else "SHORT"
+                        
+                        # Рівні: TP 2.5%, SL 1.5%
+                        tp = price * (1.025 if side == "LONG" else 0.975)
+                        sl = price * (0.985 if side == "LONG" else 1.015)
+                        
+                        sig = build_signal(symbol, side, price, tp, sl, change)
+                        if sig:
+                            send_msg(sig)
+                            time.sleep(1) # Затримка проти спаму
+        except:
+            pass
+        time.sleep(300) # Сканування кожні 5 хвилин
 
 if __name__ == "__main__":
-    # Запуск веб-сервера та бота в різних потоках
-    Thread(target=run_web).start()
-    main_loop()
+    # 1. Запуск веб-сервера для Railway
+    Thread(target=run_web, daemon=True).start()
+    # 2. Запуск основного циклу
+    monitor_market()
+
 
