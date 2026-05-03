@@ -1,152 +1,313 @@
 import os
+
 import time
+
 import requests
+
 import threading
+
 import hashlib
+
 from flask import Flask
 
-# ================= CONFIG & SECURITY =================
 TOKEN = os.getenv("TELEGRAM_TOKEN")
-CHAT_ID = os.getenv("CHAT_ID")
-BINANCE_URL = "https://api.binance.com"
 
-# Railway потребує веб-сервер, щоб тримати процес активним
+CHAT_ID = os.getenv("CHAT_ID")
+
+BINANCE = "https://api.binance.com"
+
 app = Flask(__name__)
 
 @app.route('/')
-def health_check():
-    return "🔥 Pro_Crypto_Signal_Bot is Online", 200
 
-# ================= CORE LOGIC =================
-class CryptoAnalyzer:
-    def __init__(self):
-        self.seen_signals = {}
-        self.stats = {"signals": 0, "last_coin": None}
+def home():
 
-    def get_market_data(self, symbol, interval="15m", limit=100):
+    return "✅ BOT WORKING"
+
+# ================= STATE =================
+
+SIGNALS_SENT = {}
+
+SIGNAL_TTL = 10800  # 3 години
+
+STATS = {"signals": 0, "last": "None"}
+
+# ================= TELEGRAM =================
+
+def send(text):
+
+    try:
+
+        requests.post(
+
+            f"https://api.telegram.org/bot{TOKEN}/sendMessage",
+
+            json={"chat_id": CHAT_ID, "text": text, "parse_mode": "Markdown"},
+
+            timeout=10
+
+        )
+
+    except:
+
+        pass
+
+# ================= АНТИ-ДУБЛІ =================
+
+def is_duplicate(symbol, side):
+
+    key = hashlib.md5(f"{symbol}_{side}".encode()).hexdigest()
+
+    now = time.time()
+
+    if key in SIGNALS_SENT:
+
+        if now - SIGNALS_SENT[key] < SIGNAL_TTL:
+
+            return True
+
+    SIGNALS_SENT[key] = now
+
+    return False
+
+# ================= АНАЛІЗ =================
+
+class Analyzer:
+
+    def get_klines(self, symbol):
+
         try:
-            params = {"symbol": symbol, "interval": interval, "limit": limit}
-            res = requests.get(f"{BINANCE_URL}/api/v3/klines", params=params, timeout=10)
-            return res.json()
+
+            r = requests.get(f"{BINANCE}/api/v3/klines",
+
+                             params={"symbol": symbol, "interval": "5m", "limit": 50},
+
+                             timeout=10)
+
+            return r.json()
+
         except:
+
             return None
 
-    def analyze_smc(self, symbol):
-        data = self.get_market_data(symbol)
+    def strong_signal(self, symbol):
+
+        data = self.get_klines(symbol)
+
         if not data: return None
 
-        # Форматуємо дані: [0]time, [1]open, [2]high, [3]low, [4]close, [5]volume
         closes = [float(x[4]) for x in data]
+
         highs = [float(x[2]) for x in data]
+
         lows = [float(x[3]) for x in data]
-        volumes = [float(x[5]) for x in data]
 
-        current_price = closes[-1]
-        
-        # 1. Визначаємо структуру (High/Low за 50 свічок)
-        range_high = max(highs[-50:-1])
-        range_low = min(lows[-50:-1])
-        
-        # 2. Аналіз об'єму (Pump Detection)
-        avg_vol = sum(volumes[-20:-1]) / 20
-        vol_spike = volumes[-1] > avg_vol * 3  # Сплеск у 3 рази
+        vol = [float(x[5]) for x in data]
 
-        # 3. Логіка SMC (Liquidity Sweep + Rejection)
-        signal = None
-        
-        # LONG: Ціна зняла лой і повернулася вище
-        if lows[-1] < range_low and current_price > range_low:
-            if vol_spike:
-                sl = lows[-1] * 0.998
-                tp = current_price + (current_price - sl) * 3
-                signal = self.create_signal(symbol, "LONG (SMC Sweep)", current_price, tp, sl, "High")
+        price = closes[-1]
 
-        # SHORT: Ціна зняла хай і закріпилась нижче
-        elif highs[-1] > range_high and current_price < range_high:
-            if vol_spike:
-                sl = highs[-1] * 1.002
-                tp = current_price - (sl - current_price) * 3
-                signal = self.create_signal(symbol, "SHORT (SMC Sweep)", current_price, tp, sl, "High")
+        avg_vol = sum(vol[-20:]) / 20
 
-        return signal
+        vol_spike = vol[-1] > avg_vol * 2
 
-    def create_signal(self, symbol, mode, price, tp, sl, strength):
-        # Хеш для уникнення дублів протягом 4 годин
-        signal_id = hashlib.md5(f"{symbol}{mode}".encode()).hexdigest()
-        if signal_id in self.seen_signals:
-            if time.time() - self.seen_signals[signal_id] < 14400:
-                return None
-        
-        self.seen_signals[signal_id] = time.time()
-        self.stats["signals"] += 1
-        self.stats["last_coin"] = symbol
+        range_high = max(highs[-20:])
 
-        return (f"💎 **PREMIUM SIGNAL: {symbol}**\n"
-                f"━━━━━━━━━━━━━━━━━━\n"
-                f"Тип: `{mode}`\n"
-                f"Вхід: `{price:.5f}`\n"
-                f"🎯 TP (1:3): `{tp:.5f}`\n"
-                f"🛑 SL: `{sl:.5f}`\n"
-                f"━━━━━━━━━━━━━━━━━━\n"
-                f"🔥 Сила сигналу: {strength}\n"
-                f"⚠️ Ризик-менеджмент: 1-2% від депозиту")
+        range_low = min(lows[-20:])
 
-# ================= TELEGRAM BOT =================
-bot_logic = CryptoAnalyzer()
+        # LONG SMC
 
-def send_msg(text):
-    url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
-    try:
-        requests.post(url, json={"chat_id": CHAT_ID, "text": text, "parse_mode": "Markdown"})
-    except: pass
+        if price < range_low * 1.002 and vol_spike:
 
-def market_scanner():
-    send_msg("🚀 **Система моніторингу SMC & Pump активована!**\nСканую ТОП-100 Binance...")
+            sl = min(lows[-10:])
+
+            tp = price + (price - sl) * 3
+
+            return self.build(symbol, "LONG", price, tp, sl, "SMC")
+
+        # SHORT SMC
+
+        if price > range_high * 0.998 and vol_spike:
+
+            sl = max(highs[-10:])
+
+            tp = price - (sl - price) * 3
+
+            return self.build(symbol, "SHORT", price, tp, sl, "SMC")
+
+        return None
+
+    def fast_signal(self, symbol, change):
+
+        price = float(change['lastPrice'])
+
+        change_pct = float(change['priceChangePercent'])
+
+        if abs(change_pct) < 5:
+
+            return None
+
+        side = "LONG" if change_pct > 0 else "SHORT"
+
+        if is_duplicate(symbol, side):
+
+            return None
+
+        tp = price * (1.02 if side == "LONG" else 0.98)
+
+        sl = price * (0.99 if side == "LONG" else 1.01)
+
+        return (
+
+            f"⚡️ *FAST SIGNAL*\n"
+
+            f"{symbol}\n"
+
+            f"{side}\n"
+
+            f"Entry: {price:.4f}\n"
+
+            f"TP: {tp:.4f}\n"
+
+            f"SL: {sl:.4f}\n"
+
+            f"Move: {round(change_pct,2)}%"
+
+        )
+
+    def build(self, symbol, side, entry, tp, sl, mode):
+
+        if is_duplicate(symbol, side):
+
+            return None
+
+        STATS["signals"] += 1
+
+        STATS["last"] = symbol
+
+        return (
+
+            f"🔥 *{mode} SIGNAL*\n"
+
+            f"{symbol}\n"
+
+            f"{side}\n\n"
+
+            f"Entry: {entry:.4f}\n"
+
+            f"TP: {tp:.4f}\n"
+
+            f"SL: {sl:.4f}\n\n"
+
+            f"RR 1:3 ✅"
+
+        )
+
+bot = Analyzer()
+
+# ================= СКАНЕР =================
+
+def scanner():
+
+    send("🚀 БОТ ЗАПУЩЕНИЙ (NEW LOGIC)")
+
     while True:
+
         try:
-            # Отримуємо топ монет за об'ємом
-            tickers = requests.get(f"{BINANCE_URL}/api/v3/ticker/24hr").json()
-            # Фільтруємо USDT пари з великим об'ємом
-            top_coins = sorted([t for t in tickers if t['symbol'].endswith('USDT')], 
-                               key=lambda x: float(x['quoteVolume']), reverse=True)[:100]
-            
-            for coin in top_coins:
+
+            tickers = requests.get(f"{BINANCE}/api/v3/ticker/24hr").json()
+
+            # ТОП 100 по обʼєму
+
+            coins = sorted(
+
+                [x for x in tickers if x['symbol'].endswith("USDT")],
+
+                key=lambda x: float(x['quoteVolume']),
+
+                reverse=True
+
+            )[:100]
+
+            for coin in coins:
+
                 symbol = coin['symbol']
-                signal = bot_logic.analyze_smc(symbol)
-                if signal:
-                    send_msg(signal)
-                time.sleep(0.5) # Пауза для уникнення лімітів API
-        except Exception as e:
-            print(f"Error: {e}")
-            time.sleep(10)
 
-def telegram_polling():
-    last_update = 0
+                # 1. STRONG сигнал
+
+                sig = bot.strong_signal(symbol)
+
+                if sig:
+
+                    send(sig)
+
+                    time.sleep(1)
+
+                    continue
+
+                # 2. FAST сигнал
+
+                sig = bot.fast_signal(symbol, coin)
+
+                if sig:
+
+                    send(sig)
+
+                    time.sleep(1)
+
+        except Exception as e:
+
+            print("ERROR:", e)
+
+        time.sleep(300)
+
+# ================= TELEGRAM =================
+
+def telegram():
+
+    last = 0
+
     while True:
+
         try:
-            url = f"https://api.telegram.org/bot{TOKEN}/getUpdates?offset={last_update + 1}&timeout=30"
-            res = requests.get(url).json()
-            for update in res.get("result", []):
-                last_update = update["update_id"]
-                msg = update.get("message", {})
-                text = msg.get("text", "")
-                
+
+            r = requests.get(
+
+                f"https://api.telegram.org/bot{TOKEN}/getUpdates?offset={last+1}&timeout=30"
+
+            ).json()
+
+            for u in r.get("result", []):
+
+                last = u["update_id"]
+
+                text = u.get("message", {}).get("text", "")
+
                 if text == "/status":
-                    status = (f"📊 **Статус Бота**\n"
-                             f"Знайдено сигналів: {bot_logic.stats['signals']}\n"
-                             f"Остання монета: {bot_logic.stats['last_coin']}\n"
-                             f"Сервер: Railway Active ✅")
-                    send_msg(status)
+
+                    send(f"📊 Signals: {STATS['signals']}\nLast: {STATS['last']}")
+
+                elif text == "/debug":
+
+                    send("🧠 NEW LOGIC ACTIVE:\nSMC + FAST + AntiSpam")
+
+                elif text == "/mode":
+
+                    send("⚙️ Modes:\n1. SMC (strong)\n2. FAST (pump catch)")
+
                 elif text == "/help":
-                    send_msg("Доступні команди:\n/status - перевірка роботи\n/watch - додати монету (в розробці)")
+
+                    send("/status\n/debug\n/mode")
+
         except:
+
             time.sleep(5)
 
 # ================= START =================
+
 if __name__ == "__main__":
-    # Запуск веб-сервера для Railway в окремому потоці
-    threading.Thread(target=lambda: app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))).start()
-    # Запуск сканера ринку
-    threading.Thread(target=market_scanner).start()
-    # Запуск обробки команд
-    telegram_polling()
+
+    threading.Thread(target=lambda: app.run(host="0.0.0.0", port=int(os.getenv("PORT", 8080))), daemon=True).start()
+
+    threading.Thread(target=scanner, daemon=True).start()
+
+    telegram()
