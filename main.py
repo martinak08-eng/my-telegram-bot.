@@ -1,126 +1,297 @@
-import os
-import requests
-import time
-import threading
-import hashlib
+import os, requests, time, threading, hashlib
+
 from flask import Flask, request
+
 from threading import Thread
 
-# ================= CONFIG (Береться з Railway Variables) =================
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
+
 CHAT_ID = os.environ.get("CHAT_ID")
 
-# Перевірка налаштувань
-if not TELEGRAM_TOKEN or not CHAT_ID:
-    print("⚠️ УВАГА: Перевірте змінні TELEGRAM_TOKEN та CHAT_ID у Railway!")
-
-# ================= KEEP ALIVE & WEBHOOKS =================
 app = Flask('')
 
-@app.route('/')
-def home():
-    return "✅ Бот працює стабільно"
+# ================= STATE =================
 
-# Обробка натискання кнопок у Telegram
-@app.route('/webhook', methods=['POST'])
-def webhook():
-    try:
-        update = request.get_json()
-        if "message" in update:
-            text = update["message"].get("text")
-            user_id = str(update["message"]["chat"]["id"])
-            
-            # Обробка команд від власника (CHAT_ID)
-            if user_id == CHAT_ID:
-                if text == "📊 Статус":
-                    send_msg("⚙️ **Статус системи:**\n💎 Моніторинг Binance: АКТИВНО\n📡 З'єднання з API: СТАБІЛЬНЕ\n🚀 Режим: АНТИ-СПАМ")
-                elif text == "👀 Watchlist":
-                    send_msg("🔎 **Watchlist:**\nПеревіряю ТОП-30 пар USDT на Binance за волатильністю...")
-                elif text == "📈 Угоди":
-                    send_msg(f"💼 **Портфель:**\nНаразі в пам'яті активних сигналів: {len(OPEN_TRADES)}")
-                elif text == "🏆 Stats":
-                    send_msg("📊 **Статистика сесії:**\n✅ Прибуток: +0.0%\n🎯 Win Rate: 100% (очікування даних)")
-    except Exception as e:
-        print(f"Помилка Webhook: {e}")
-    return "OK", 200
-
-def run_web():
-    port = int(os.environ.get("PORT", 8080))
-    app.run(host='0.0.0.0', port=port)
-
-# ================= ЛОГІКА ТА ФІЛЬТРАЦІЯ =================
 OPEN_TRADES = []
-SIGNAL_CACHE = {} 
-SIGNAL_TTL = 7200 # 2 години не повторювати один сигнал
 
-def send_msg(msg):
-    if not TELEGRAM_TOKEN or not CHAT_ID: return
-    try:
-        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-        data = {"chat_id": CHAT_ID, "text": msg, "parse_mode": "Markdown"}
-        requests.post(url, data=data, timeout=10)
-    except Exception as e:
-        print(f"Помилка відправки: {e}")
+LAST_SIGNAL_TIME = 0
 
-def build_signal(symbol, side, entry, tp, sl, impulse):
-    # Унікальний ключ сигналу (монета + напрямок + ціна)
-    sig_id = hashlib.md5(f"{symbol}_{side}_{round(entry, 2)}".encode()).hexdigest()
-    
+GLOBAL_COOLDOWN = 10
+
+SYMBOL_COOLDOWN = {}
+
+SYMBOL_BLOCK_TIME = 3600
+
+# ================= TELEGRAM =================
+
+def send(msg):
+
+    global LAST_SIGNAL_TIME
+
     now = time.time()
-    if sig_id in SIGNAL_CACHE:
-        if now - SIGNAL_CACHE[sig_id] < SIGNAL_TTL:
-            return None # Ігноруємо дублікат
-            
-    SIGNAL_CACHE[sig_id] = now
-    
-    emoji = "🟢 LONG" if side == "LONG" else "🔴 SHORT"
-    animation = "📈" if side == "LONG" else "📉"
-    
-    return (
-        f"{animation} **НОВИЙ СИГНАЛ: {symbol}**\n"
-        f"━━━━━━━━━━━━━━━\n"
-        f"Тип: `{emoji}`\n"
-        f"💵 Вхід: `{round(entry, 5)}`\n"
-        f"🎯 Тейк: `{round(tp, 5)}`\n"
-        f"🛑 Стоп: `{round(sl, 5)}`\n"
-        f"━━━━━━━━━━━━━━━\n"
-        f"⚡️ Імпульс: `{round(impulse, 2)}%`"
-    )
 
-def monitor_market():
-    # Повідомлення про запуск (лише ОДИН РАЗ)
-    send_msg("🚀 **Бот успішно активований!**\nНалаштування анти-спаму та кнопок застосовані.")
-    
-    while True:
+    if now - LAST_SIGNAL_TIME < GLOBAL_COOLDOWN:
+
+        return
+
+    LAST_SIGNAL_TIME = now
+
+    try:
+
+        requests.post(
+
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+
+            data={"chat_id": CHAT_ID, "text": msg},
+
+            timeout=10
+
+        )
+
+    except:
+
+        pass
+
+# ================= COMMANDS =================
+
+@app.route('/webhook', methods=['POST'])
+
+def webhook():
+
+    try:
+
+        update = request.get_json()
+
+        if "message" in update:
+
+            text = update["message"]["text"].lower()
+
+            if "статус" in text:
+
+                send(f"🤖 BOT STATUS\nАктивні угоди: {len(OPEN_TRADES)}")
+
+            elif "угоди" in text:
+
+                if not OPEN_TRADES:
+
+                    send("Немає відкритих угод")
+
+                else:
+
+                    msg = "📈 Угоди:\n"
+
+                    for t in OPEN_TRADES:
+
+                        msg += f"{t['symbol']} {t['side']}\n"
+
+                    send(msg)
+
+    except:
+
+        pass
+
+    return "ok"
+
+@app.route('/')
+
+def home():
+
+    return "Bot running"
+
+# ================= DATA =================
+
+def get_symbols():
+
+    data = requests.get("https://api.binance.com/api/v3/ticker/24hr").json()
+
+    coins = []
+
+    for c in data:
+
         try:
-            # Отримання даних Binance
-            r = requests.get("https://api.binance.com/api/v3/ticker/24hr", timeout=10).json()
-            for item in r:
-                symbol = item['symbol']
-                if symbol.endswith("USDT"):
-                    change = float(item['priceChangePercent'])
-                    
-                    # Фільтр на сильний рух (більше 4.5%)
-                    if abs(change) > 4.5:
-                        price = float(item['lastPrice'])
-                        side = "LONG" if change > 0 else "SHORT"
-                        
-                        # Рівні: TP 2.5%, SL 1.5%
-                        tp = price * (1.025 if side == "LONG" else 0.975)
-                        sl = price * (0.985 if side == "LONG" else 1.015)
-                        
-                        sig = build_signal(symbol, side, price, tp, sl, change)
-                        if sig:
-                            send_msg(sig)
-                            time.sleep(1) # Затримка проти спаму
+
+            if c["symbol"].endswith("USDT"):
+
+                vol = float(c["quoteVolume"])
+
+                if vol > 50000000:
+
+                    coins.append((c["symbol"], vol))
+
         except:
-            pass
-        time.sleep(300) # Сканування кожні 5 хвилин
+
+            continue
+
+    coins.sort(key=lambda x: -x[1])
+
+    return [c[0] for c in coins[:50]]
+
+def klines(symbol, tf="5m"):
+
+    return requests.get(
+
+        "https://api.binance.com/api/v3/klines",
+
+        params={"symbol":symbol,"interval":tf,"limit":100}
+
+    ).json()
+
+# ================= ANALYSIS =================
+
+def trend(closes):
+
+    ma20 = sum(closes[-20:]) / 20
+
+    ma50 = sum(closes[-50:]) / 50
+
+    return "LONG" if ma20 > ma50 else "SHORT"
+
+def confidence(vol_spike, imp, trend_match):
+
+    score = 0
+
+    if vol_spike: score += 40
+
+    if abs(imp) > 3: score += 30
+
+    if trend_match: score += 30
+
+    return score
+
+# ================= SIGNAL =================
+
+def build(symbol, side, price, tp, sl, imp, conf, mode):
+
+    now = time.time()
+
+    if symbol in SYMBOL_COOLDOWN:
+
+        if now - SYMBOL_COOLDOWN[symbol] < SYMBOL_BLOCK_TIME:
+
+            return None
+
+    SYMBOL_COOLDOWN[symbol] = now
+
+    OPEN_TRADES.append({"symbol":symbol,"side":side})
+
+    return f"""🔥 {mode}
+
+{symbol} {side}
+
+Entry: {round(price,4)}
+
+TP: {round(tp,4)}
+
+SL: {round(sl,4)}
+
+Impulse: {round(imp,2)}%
+
+Confidence: {conf}%"""
+
+# ================= STRATEGIES =================
+
+def smart_money(symbol):
+
+    k = klines(symbol, "15m")
+
+    if not k or len(k) < 50:
+
+        return None
+
+    closes = [float(x[4]) for x in k]
+
+    vol = [float(x[5]) for x in k]
+
+    t = trend(closes)
+
+    imp = (closes[-1] - closes[-5]) / closes[-5] * 100
+
+    avg_vol = sum(vol[-20:]) / 20
+
+    vol_spike = vol[-1] > avg_vol * 2
+
+    conf = confidence(vol_spike, imp, True)
+
+    if vol_spike and abs(imp) > 2:
+
+        price = closes[-1]
+
+        if t == "LONG":
+
+            sl = price * 0.99
+
+            tp = price * 1.03
+
+            return build(symbol,"LONG",price,tp,sl,imp,conf,"SMART")
+
+        else:
+
+            sl = price * 1.01
+
+            tp = price * 0.97
+
+            return build(symbol,"SHORT",price,tp,sl,imp,conf,"SMART")
+
+def pump(symbol):
+
+    k = klines(symbol,"5m")
+
+    if not k: return None
+
+    closes = [float(x[4]) for x in k]
+
+    vol = [float(x[5]) for x in k]
+
+    imp = (closes[-1] - closes[-3]) / closes[-3] * 100
+
+    avg_vol = sum(vol[:-1]) / len(vol[:-1])
+
+    if vol[-1] > avg_vol * 3 and abs(imp) > 3:
+
+        price = closes[-1]
+
+        side = "LONG" if imp > 0 else "SHORT"
+
+        sl = price * (0.995 if side=="LONG" else 1.005)
+
+        tp = price * (1.03 if side=="LONG" else 0.97)
+
+        return build(symbol,side,price,tp,sl,imp,80,"PUMP")
+
+# ================= MAIN =================
+
+def run():
+
+    send("🚀 BOT STARTED")
+
+    while True:
+
+        symbols = get_symbols()
+
+        for s in symbols:
+
+            try:
+
+                sig = smart_money(s) or pump(s)
+
+                if sig:
+
+                    send(sig)
+
+                    break
+
+            except:
+
+                continue
+
+        time.sleep(300)
+
+# ================= START =================
 
 if __name__ == "__main__":
-    # 1. Запуск веб-сервера для Railway
-    Thread(target=run_web, daemon=True).start()
-    # 2. Запуск основного циклу
-    monitor_market()
+
+    Thread(target=lambda: app.run(host="0.0.0.0", port=8080)).start()
+
+    run()
 
 
