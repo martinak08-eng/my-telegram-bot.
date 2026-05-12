@@ -1,3 +1,13 @@
+# =========================================================
+
+# 🚀 FUTURES INTRADAY SMART MONEY BOT
+
+# FULL FINAL VERSION
+
+# Railway / Render / Replit READY
+
+# =========================================================
+
 import os
 
 import time
@@ -8,7 +18,15 @@ import threading
 
 import hashlib
 
+from statistics import mean
+
 from flask import Flask
+
+# =========================================================
+
+# CONFIG
+
+# =========================================================
 
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 
@@ -16,25 +34,37 @@ CHAT_ID = os.getenv("CHAT_ID")
 
 BINANCE = "https://api.binance.com"
 
+SCAN_INTERVAL = 300          # 5 хв
+
+MAX_COINS = 150              # топ ліквідних монет
+
+SIGNAL_COOLDOWN = 21600      # 6 год антиспам
+
+MIN_SCORE = 10               # мінімальний рейтинг
+
+MIN_VOLUME = 35000000        # мін. ліквідність
+
+# =========================================================
+
+# FLASK SERVER
+
+# =========================================================
+
 app = Flask(__name__)
 
-@app.route('/')
+@app.route("/")
 
 def home():
 
-    return "✅ BOT WORKING"
+    return "✅ FUTURES BOT ONLINE", 200
 
-# ================= STATE =================
+# =========================================================
 
-SIGNALS_SENT = {}
+# TELEGRAM SEND
 
-SIGNAL_TTL = 10800  # 3 години
+# =========================================================
 
-STATS = {"signals": 0, "last": "None"}
-
-# ================= TELEGRAM =================
-
-def send(text):
+def send_message(text):
 
     try:
 
@@ -42,47 +72,79 @@ def send(text):
 
             f"https://api.telegram.org/bot{TOKEN}/sendMessage",
 
-            json={"chat_id": CHAT_ID, "text": text, "parse_mode": "Markdown"},
+            json={
+
+                "chat_id": CHAT_ID,
+
+                "text": text,
+
+                "parse_mode": "Markdown"
+
+            },
 
             timeout=10
 
         )
 
-    except:
+    except Exception as e:
 
-        pass
+        print("TG ERROR:", e)
 
-# ================= АНТИ-ДУБЛІ =================
+# =========================================================
 
-def is_duplicate(symbol, side):
+# MAIN BOT
 
-    key = hashlib.md5(f"{symbol}_{side}".encode()).hexdigest()
+# =========================================================
 
-    now = time.time()
+class FuturesBot:
 
-    if key in SIGNALS_SENT:
+    def __init__(self):
 
-        if now - SIGNALS_SENT[key] < SIGNAL_TTL:
+        self.sent_signals = {}
 
-            return True
+        self.stats = {
 
-    SIGNALS_SENT[key] = now
+            "signals": 0,
 
-    return False
+            "wins": 0,
 
-# ================= АНАЛІЗ =================
+            "losses": 0,
 
-class Analyzer:
+            "last_signal": "NONE"
 
-    def get_klines(self, symbol):
+        }
+
+    # =====================================================
+
+    # GET KLINES
+
+    # =====================================================
+
+    def get_klines(self, symbol, interval, limit=120):
 
         try:
 
-            r = requests.get(f"{BINANCE}/api/v3/klines",
+            r = requests.get(
 
-                             params={"symbol": symbol, "interval": "5m", "limit": 50},
+                f"{BINANCE}/api/v3/klines",
 
-                             timeout=10)
+                params={
+
+                    "symbol": symbol,
+
+                    "interval": interval,
+
+                    "limit": limit
+
+                },
+
+                timeout=10
+
+            )
+
+            if r.status_code != 200:
+
+                return None
 
             return r.json()
 
@@ -90,224 +152,730 @@ class Analyzer:
 
             return None
 
-    def strong_signal(self, symbol):
+    # =====================================================
 
-        data = self.get_klines(symbol)
+    # EMA
 
-        if not data: return None
+    # =====================================================
 
-        closes = [float(x[4]) for x in data]
+    def ema(self, data, period):
 
-        highs = [float(x[2]) for x in data]
-
-        lows = [float(x[3]) for x in data]
-
-        vol = [float(x[5]) for x in data]
-
-        price = closes[-1]
-
-        avg_vol = sum(vol[-20:]) / 20
-
-        vol_spike = vol[-1] > avg_vol * 2
-
-        range_high = max(highs[-20:])
-
-        range_low = min(lows[-20:])
-
-        # LONG SMC
-
-        if price < range_low * 1.002 and vol_spike:
-
-            sl = min(lows[-10:])
-
-            tp = price + (price - sl) * 3
-
-            return self.build(symbol, "LONG", price, tp, sl, "SMC")
-
-        # SHORT SMC
-
-        if price > range_high * 0.998 and vol_spike:
-
-            sl = max(highs[-10:])
-
-            tp = price - (sl - price) * 3
-
-            return self.build(symbol, "SHORT", price, tp, sl, "SMC")
-
-        return None
-
-    def fast_signal(self, symbol, change):
-
-        price = float(change['lastPrice'])
-
-        change_pct = float(change['priceChangePercent'])
-
-        if abs(change_pct) < 5:
+        if len(data) < period:
 
             return None
 
-        side = "LONG" if change_pct > 0 else "SHORT"
+        multiplier = 2 / (period + 1)
 
-        if is_duplicate(symbol, side):
+        ema = mean(data[:period])
+
+        for price in data[period:]:
+
+            ema = ((price - ema) * multiplier) + ema
+
+        return ema
+
+    # =====================================================
+
+    # RSI
+
+    # =====================================================
+
+    def rsi(self, closes, period=14):
+
+        gains = []
+
+        losses = []
+
+        for i in range(-period, -1):
+
+            diff = closes[i] - closes[i - 1]
+
+            if diff > 0:
+
+                gains.append(diff)
+
+            else:
+
+                losses.append(abs(diff))
+
+        avg_gain = mean(gains) if gains else 0.001
+
+        avg_loss = mean(losses) if losses else 0.001
+
+        rs = avg_gain / avg_loss
+
+        return 100 - (100 / (1 + rs))
+
+    # =====================================================
+
+    # MAIN ANALYSIS
+
+    # =====================================================
+
+    def analyze(self, symbol):
+
+        # =================================================
+
+        # MULTI TIMEFRAME
+
+        # =================================================
+
+        data_15m = self.get_klines(symbol, "15m")
+
+        data_1h = self.get_klines(symbol, "1h")
+
+        if not data_15m or not data_1h:
 
             return None
 
-        tp = price * (1.02 if side == "LONG" else 0.98)
+        closes = [float(x[4]) for x in data_15m]
 
-        sl = price * (0.99 if side == "LONG" else 1.01)
+        highs = [float(x[2]) for x in data_15m]
 
-        return (
+        lows = [float(x[3]) for x in data_15m]
 
-            f"⚡️ *FAST SIGNAL*\n"
+        volumes = [float(x[5]) for x in data_15m]
 
-            f"{symbol}\n"
+        closes_1h = [float(x[4]) for x in data_1h]
 
-            f"{side}\n"
+        current = closes[-1]
 
-            f"Entry: {price:.4f}\n"
+        # =================================================
 
-            f"TP: {tp:.4f}\n"
+        # TREND FILTER
 
-            f"SL: {sl:.4f}\n"
+        # =================================================
 
-            f"Move: {round(change_pct,2)}%"
+        ema20 = self.ema(closes_1h, 20)
+
+        ema50 = self.ema(closes_1h, 50)
+
+        if not ema20 or not ema50:
+
+            return None
+
+        bullish = ema20 > ema50
+
+        bearish = ema20 < ema50
+
+        # =================================================
+
+        # VOLUME FILTER
+
+        # =================================================
+
+        avg_volume = mean(volumes[-25:])
+
+        volume_spike = volumes[-1] > avg_volume * 2.5
+
+        if not volume_spike:
+
+            return None
+
+        # =================================================
+
+        # MOMENTUM FILTER
+
+        # =================================================
+
+        impulse = (
+
+            (closes[-1] - closes[-5])
+
+            / closes[-5]
+
+        ) * 100
+
+        long_impulse = impulse > 2.3
+
+        short_impulse = impulse < -2.3
+
+        # =================================================
+
+        # VOLATILITY FILTER
+
+        # =================================================
+
+        volatility = (
+
+            (max(highs[-20:]) - min(lows[-20:]))
+
+            / current
+
+        ) * 100
+
+        if volatility < 3:
+
+            return None
+
+        # =================================================
+
+        # LIQUIDITY SWEEP
+
+        # =================================================
+
+        recent_high = max(highs[-30:-1])
+
+        recent_low = min(lows[-30:-1])
+
+        sweep_low = lows[-1] < recent_low
+
+        sweep_high = highs[-1] > recent_high
+
+        # =================================================
+
+        # RSI
+
+        # =================================================
+
+        rsi = self.rsi(closes)
+
+        # =================================================
+
+        # LONG SCORE
+
+        # =================================================
+
+        long_score = 0
+
+        long_reasons = []
+
+        if bullish:
+
+            long_score += 2
+
+            long_reasons.append("1H bullish trend")
+
+        if long_impulse:
+
+            long_score += 3
+
+            long_reasons.append("Strong bullish impulse")
+
+        if volume_spike:
+
+            long_score += 2
+
+            long_reasons.append("Volume spike")
+
+        if sweep_low:
+
+            long_score += 2
+
+            long_reasons.append("Liquidity sweep")
+
+        if 45 < rsi < 70:
+
+            long_score += 1
+
+            long_reasons.append("Healthy RSI")
+
+        # =================================================
+
+        # SHORT SCORE
+
+        # =================================================
+
+        short_score = 0
+
+        short_reasons = []
+
+        if bearish:
+
+            short_score += 2
+
+            short_reasons.append("1H bearish trend")
+
+        if short_impulse:
+
+            short_score += 3
+
+            short_reasons.append("Strong bearish impulse")
+
+        if volume_spike:
+
+            short_score += 2
+
+            short_reasons.append("Volume spike")
+
+        if sweep_high:
+
+            short_score += 2
+
+            short_reasons.append("Liquidity sweep")
+
+        if 30 < rsi < 55:
+
+            short_score += 1
+
+            short_reasons.append("Healthy RSI")
+
+        # =================================================
+
+        # FINAL DECISION
+
+        # =================================================
+
+        direction = None
+
+        score = 0
+
+        reasons = []
+
+        if long_score >= MIN_SCORE and long_score > short_score:
+
+            direction = "LONG"
+
+            score = long_score
+
+            reasons = long_reasons
+
+        elif short_score >= MIN_SCORE and short_score > long_score:
+
+            direction = "SHORT"
+
+            score = short_score
+
+            reasons = short_reasons
+
+        else:
+
+            return None
+
+        # =================================================
+
+        # ANTI SPAM
+
+        # =================================================
+
+        signal_hash = hashlib.md5(
+
+            f"{symbol}{direction}".encode()
+
+        ).hexdigest()
+
+        now = time.time()
+
+        if signal_hash in self.sent_signals:
+
+            if now - self.sent_signals[signal_hash] < SIGNAL_COOLDOWN:
+
+                return None
+
+        self.sent_signals[signal_hash] = now
+
+        # =================================================
+
+        # TAKE PROFIT / STOP LOSS
+
+        # =================================================
+
+        if direction == "LONG":
+
+            sl = min(lows[-12:]) * 0.998
+
+            risk = current - sl
+
+            tp = current + (risk * 3)
+
+        else:
+
+            sl = max(highs[-12:]) * 1.002
+
+            risk = sl - current
+
+            tp = current - (risk * 3)
+
+        # =================================================
+
+        # TP DISTANCE FILTER
+
+        # =================================================
+
+        tp_distance = abs((tp - current) / current) * 100
+
+        if tp_distance < 3:
+
+            return None
+
+        # =================================================
+
+        # CONFIDENCE
+
+        # =================================================
+
+        confidence = min(96, 76 + score * 2)
+
+        # =================================================
+
+        # SETUP TYPE
+
+        # =================================================
+
+        setup_type = (
+
+            "⚡ Pump / Momentum"
+
+            if abs(impulse) > 3
+
+            else "📈 Smart Money Intraday"
 
         )
 
-    def build(self, symbol, side, entry, tp, sl, mode):
+        # =================================================
 
-        if is_duplicate(symbol, side):
+        # DURATION
 
-            return None
+        # =================================================
 
-        STATS["signals"] += 1
+        if abs(impulse) > 4:
 
-        STATS["last"] = symbol
+            duration = "2-6 годин"
 
-        return (
+        else:
 
-            f"🔥 *{mode} SIGNAL*\n"
+            duration = "6-24 години"
 
-            f"{symbol}\n"
+        # =================================================
 
-            f"{side}\n\n"
+        # STATS
 
-            f"Entry: {entry:.4f}\n"
+        # =================================================
 
-            f"TP: {tp:.4f}\n"
+        self.stats["signals"] += 1
 
-            f"SL: {sl:.4f}\n\n"
+        self.stats["last_signal"] = symbol
 
-            f"RR 1:3 ✅"
+        # =================================================
 
-        )
+        # FINAL MESSAGE
 
-bot = Analyzer()
+        # =================================================
 
-# ================= СКАНЕР =================
+        text = f"""
 
-def scanner():
+🔥 *PREMIUM FUTURES SIGNAL*
 
-    send("🚀 БОТ ЗАПУЩЕНИЙ (NEW LOGIC)")
+💎 Pair:
+
+`{symbol}`
+
+📊 Direction:
+
+`{direction}`
+
+⚡ Setup:
+
+{setup_type}
+
+💰 Entry:
+
+`{round(current, 6)}`
+
+🛑 Stop Loss:
+
+`{round(sl, 6)}`
+
+🎯 Take Profit:
+
+`{round(tp, 6)}`
+
+📈 Confidence:
+
+*{confidence}%*
+
+⏳ Expected Duration:
+
+`{duration}`
+
+━━━━━━━━━━━━━━━
+
+🧠 Confirmations:
+
+"""
+
+        for r in reasons:
+
+            text += f"\n• {r}"
+
+        text += """
+
+━━━━━━━━━━━━━━━
+
+📌 Risk Reward:
+
+1:3
+
+🛡 Anti-Spam:
+
+Enabled
+
+💡 Position Type:
+
+Intraday Futures
+
+"""
+
+        return text
+
+# =========================================================
+
+# BOT INSTANCE
+
+# =========================================================
+
+bot = FuturesBot()
+
+# =========================================================
+
+# MARKET SCANNER
+
+# =========================================================
+
+def market_scanner():
+
+    send_message(
+
+        "🚀 *FUTURES INTRADAY BOT ACTIVATED*\n"
+
+        "🔍 Scanning Binance Futures Market\n"
+
+        "⚡ High Quality Mode Enabled"
+
+    )
 
     while True:
 
         try:
 
-            tickers = requests.get(f"{BINANCE}/api/v3/ticker/24hr").json()
+            tickers = requests.get(
 
-            # ТОП 100 по обʼєму
+                f"{BINANCE}/api/v3/ticker/24hr",
 
-            coins = sorted(
-
-                [x for x in tickers if x['symbol'].endswith("USDT")],
-
-                key=lambda x: float(x['quoteVolume']),
-
-                reverse=True
-
-            )[:100]
-
-            for coin in coins:
-
-                symbol = coin['symbol']
-
-                # 1. STRONG сигнал
-
-                sig = bot.strong_signal(symbol)
-
-                if sig:
-
-                    send(sig)
-
-                    time.sleep(1)
-
-                    continue
-
-                # 2. FAST сигнал
-
-                sig = bot.fast_signal(symbol, coin)
-
-                if sig:
-
-                    send(sig)
-
-                    time.sleep(1)
-
-        except Exception as e:
-
-            print("ERROR:", e)
-
-        time.sleep(300)
-
-# ================= TELEGRAM =================
-
-def telegram():
-
-    last = 0
-
-    while True:
-
-        try:
-
-            r = requests.get(
-
-                f"https://api.telegram.org/bot{TOKEN}/getUpdates?offset={last+1}&timeout=30"
+                timeout=15
 
             ).json()
 
-            for u in r.get("result", []):
+            filtered = []
 
-                last = u["update_id"]
+            for t in tickers:
 
-                text = u.get("message", {}).get("text", "")
+                try:
 
-                if text == "/status":
+                    symbol = t["symbol"]
 
-                    send(f"📊 Signals: {STATS['signals']}\nLast: {STATS['last']}")
+                    if not symbol.endswith("USDT"):
 
-                elif text == "/debug":
+                        continue
 
-                    send("🧠 NEW LOGIC ACTIVE:\nSMC + FAST + AntiSpam")
+                    volume = float(t["quoteVolume"])
 
-                elif text == "/mode":
+                    change = abs(float(t["priceChangePercent"]))
 
-                    send("⚙️ Modes:\n1. SMC (strong)\n2. FAST (pump catch)")
+                    # FILTER LOW QUALITY
 
-                elif text == "/help":
+                    if volume < MIN_VOLUME:
 
-                    send("/status\n/debug\n/mode")
+                        continue
 
-        except:
+                    if change < 2:
+
+                        continue
+
+                    filtered.append(t)
+
+                except:
+
+                    continue
+
+            # =================================================
+
+            # SORT BY VOLUME
+
+            # =================================================
+
+            filtered = sorted(
+
+                filtered,
+
+                key=lambda x: float(x["quoteVolume"]),
+
+                reverse=True
+
+            )[:MAX_COINS]
+
+            # =================================================
+
+            # ANALYZE
+
+            # =================================================
+
+            for coin in filtered:
+
+                symbol = coin["symbol"]
+
+                signal = bot.analyze(symbol)
+
+                if signal:
+
+                    send_message(signal)
+
+                time.sleep(0.7)
+
+            print("SCAN FINISHED")
+
+            time.sleep(SCAN_INTERVAL)
+
+        except Exception as e:
+
+            print("SCAN ERROR:", e)
+
+            time.sleep(15)
+
+# =========================================================
+
+# TELEGRAM COMMANDS
+
+# =========================================================
+
+def telegram_commands():
+
+    last_update = 0
+
+    while True:
+
+        try:
+
+            url = (
+
+                f"https://api.telegram.org/bot{TOKEN}"
+
+                f"/getUpdates?offset={last_update + 1}&timeout=30"
+
+            )
+
+            res = requests.get(url, timeout=35).json()
+
+            for update in res.get("result", []):
+
+                last_update = update["update_id"]
+
+                msg = update.get("message", {})
+
+                text = msg.get("text", "").lower()
+
+                # =================================================
+
+                if text in ["/status", "📊 статус"]:
+
+                    send_message(
+
+                        f"""
+
+📊 *BOT STATUS*
+
+✅ Scanner: ACTIVE
+
+✅ Smart Money: ENABLED
+
+✅ Intraday Mode: ENABLED
+
+✅ Anti-Spam: ENABLED
+
+📈 Signals:
+
+`{bot.stats["signals"]}`
+
+💎 Last Signal:
+
+`{bot.stats["last_signal"]}`
+
+⚡ Strategy:
+
+Intraday Momentum + SMC
+
+"""
+
+                    )
+
+                # =================================================
+
+                elif text in ["/logic", "🧠 логіка"]:
+
+                    send_message(
+
+                        """
+
+🧠 *CURRENT BOT LOGIC*
+
+✅ Full Binance scan
+
+✅ Smart Money concepts
+
+✅ Liquidity sweeps
+
+✅ Momentum entries
+
+✅ Volume confirmation
+
+✅ Trend confirmation
+
+✅ Intraday signals
+
+✅ High liquidity only
+
+✅ Volatility filter
+
+✅ RSI filter
+
+✅ 1:3 Risk Reward
+
+✅ Anti-spam system
+
+🚫 Weak setups ignored
+
+🚫 Low volume ignored
+
+🚫 Sideways market ignored
+
+"""
+
+                    )
+
+        except Exception as e:
+
+            print("TG ERROR:", e)
 
             time.sleep(5)
 
-# ================= START =================
+# =========================================================
+
+# START
+
+# =========================================================
 
 if __name__ == "__main__":
 
-    threading.Thread(target=lambda: app.run(host="0.0.0.0", port=int(os.getenv("PORT", 8080))), daemon=True).start()
+    threading.Thread(
 
-    threading.Thread(target=scanner, daemon=True).start()
+        target=lambda: app.run(
 
-    telegram()
+            host="0.0.0.0",
+
+            port=int(os.environ.get("PORT", 8080))
+
+        ),
+
+        daemon=True
+
+    ).start()
+
+    threading.Thread(
+
+        target=market_scanner,
+
+        daemon=True
+
+    ).start()
+
+    telegram_commands()
