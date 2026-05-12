@@ -1,13 +1,3 @@
-# =========================================================
-
-# 🚀 FUTURES INTRADAY SMART MONEY BOT
-
-# FULL FINAL VERSION
-
-# Railway / Render / Replit READY
-
-# =========================================================
-
 import os
 
 import time
@@ -18,13 +8,11 @@ import threading
 
 import hashlib
 
-from statistics import mean
-
 from flask import Flask
 
 # =========================================================
 
-# CONFIG
+#                CONFIG
 
 # =========================================================
 
@@ -32,21 +20,23 @@ TOKEN = os.getenv("TELEGRAM_TOKEN")
 
 CHAT_ID = os.getenv("CHAT_ID")
 
-BINANCE = "https://api.binance.com"
+BINANCE_URL = "https://fapi.binance.com"
 
-SCAN_INTERVAL = 300          # 5 хв
+SCAN_INTERVAL = 300
 
-MAX_COINS = 150              # топ ліквідних монет
+TOP_COINS_LIMIT = 120
 
-SIGNAL_COOLDOWN = 21600      # 6 год антиспам
+MIN_VOLUME_USDT = 30000000
 
-MIN_SCORE = 10               # мінімальний рейтинг
+MIN_VOLATILITY = 3.0
 
-MIN_VOLUME = 35000000        # мін. ліквідність
+MIN_SCORE = 7
+
+ANTI_SPAM_MINUTES = 360
 
 # =========================================================
 
-# FLASK SERVER
+#                FLASK (REPLIT / RAILWAY)
 
 # =========================================================
 
@@ -56,21 +46,59 @@ app = Flask(__name__)
 
 def home():
 
-    return "✅ FUTURES BOT ONLINE", 200
+    return "🚀 Intraday Ultra v9 FINAL ACTIVE", 200
 
 # =========================================================
 
-# TELEGRAM SEND
+#                BOT CORE
+
+# =========================================================
+
+class IntradayBot:
+
+    def __init__(self):
+
+        self.sent_signals = {}
+
+        self.active_trades = {}
+
+        self.closed_trades = []
+
+        self.watchlist = []
+
+        self.stats = {
+
+            "signals": 0,
+
+            "wins": 0,
+
+            "losses": 0,
+
+            "pump": 0,
+
+            "smart": 0,
+
+            "last": "-"
+
+        }
+
+bot = IntradayBot()
+
+# =========================================================
+
+#                TELEGRAM
 
 # =========================================================
 
 def send_message(text):
 
+    url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
+
     try:
 
         requests.post(
 
-            f"https://api.telegram.org/bot{TOKEN}/sendMessage",
+            url,
 
             json={
 
@@ -82,565 +110,447 @@ def send_message(text):
 
             },
 
-            timeout=10
+            timeout=15
 
         )
 
     except Exception as e:
 
-        print("TG ERROR:", e)
+        print(e)
 
 # =========================================================
 
-# MAIN BOT
+#                MARKET DATA
 
 # =========================================================
 
-class FuturesBot:
+def get_klines(symbol, interval="15m", limit=120):
 
-    def __init__(self):
+    try:
 
-        self.sent_signals = {}
+        url = f"{BINANCE_URL}/fapi/v1/klines"
 
-        self.stats = {
+        params = {
 
-            "signals": 0,
+            "symbol": symbol,
 
-            "wins": 0,
+            "interval": interval,
 
-            "losses": 0,
-
-            "last_signal": "NONE"
+            "limit": limit
 
         }
 
+        r = requests.get(url, params=params, timeout=15)
+
+        return r.json()
+
+    except:
+
+        return None
+
+def get_price(symbol):
+
+    try:
+
+        url = f"{BINANCE_URL}/fapi/v1/ticker/price"
+
+        r = requests.get(
+
+            url,
+
+            params={"symbol": symbol},
+
+            timeout=10
+
+        ).json()
+
+        return float(r["price"])
+
+    except:
+
+        return None
+
+# =========================================================
+
+#                ANALYSIS
+
+# =========================================================
+
+def analyze_symbol(symbol):
+
+    data = get_klines(symbol)
+
+    if not data or len(data) < 80:
+
+        return None
+
+    closes = [float(x[4]) for x in data]
+
+    highs = [float(x[2]) for x in data]
+
+    lows = [float(x[3]) for x in data]
+
+    volumes = [float(x[5]) for x in data]
+
+    current = closes[-1]
+
+    high_20 = max(highs[-20:])
+
+    low_20 = min(lows[-20:])
+
+    avg_volume = sum(volumes[-25:-1]) / 24
+
+    current_volume = volumes[-1]
+
+    volume_ratio = current_volume / avg_volume
+
+    volatility = ((high_20 - low_20) / low_20) * 100
+
+    ema_fast = sum(closes[-9:]) / 9
+
+    ema_slow = sum(closes[-21:]) / 21
+
+    momentum = ((current - closes[-6]) / closes[-6]) * 100
+
+    score = 0
+
+    signal_type = None
+
+    side = None
+
     # =====================================================
 
-    # GET KLINES
+    # SMART MONEY LONG
 
     # =====================================================
 
-    def get_klines(self, symbol, interval, limit=120):
+    if (
+
+        current > ema_fast
+
+        and ema_fast > ema_slow
+
+        and volume_ratio >= 2.5
+
+        and momentum >= 2.2
+
+        and volatility >= MIN_VOLATILITY
+
+    ):
+
+        score += 7
+
+        signal_type = "SMART MONEY"
+
+        side = "LONG"
+
+    # =====================================================
+
+    # SMART MONEY SHORT
+
+    # =====================================================
+
+    elif (
+
+        current < ema_fast
+
+        and ema_fast < ema_slow
+
+        and volume_ratio >= 2.5
+
+        and momentum <= -2.2
+
+        and volatility >= MIN_VOLATILITY
+
+    ):
+
+        score += 7
+
+        signal_type = "SMART MONEY"
+
+        side = "SHORT"
+
+    # =====================================================
+
+    # PUMP LONG
+
+    # =====================================================
+
+    if (
+
+        current >= high_20 * 0.995
+
+        and volume_ratio >= 3.5
+
+        and momentum >= 3
+
+    ):
+
+        score += 3
+
+        signal_type = "PUMP"
+
+        side = "LONG"
+
+    # =====================================================
+
+    # DUMP SHORT
+
+    # =====================================================
+
+    if (
+
+        current <= low_20 * 1.005
+
+        and volume_ratio >= 3.5
+
+        and momentum <= -3
+
+    ):
+
+        score += 3
+
+        signal_type = "DUMP"
+
+        side = "SHORT"
+
+    # =====================================================
+
+    # QUALITY FILTER
+
+    # =====================================================
+
+    if score < MIN_SCORE:
+
+        return None
+
+    # =====================================================
+
+    # ATR STOP LOSS
+
+    # =====================================================
+
+    atr = (max(highs[-14:]) - min(lows[-14:])) / current
+
+    if side == "LONG":
+
+        sl = current * (1 - atr * 1.2)
+
+        tp = current + ((current - sl) * 3)
+
+    else:
+
+        sl = current * (1 + atr * 1.2)
+
+        tp = current - ((sl - current) * 3)
+
+    rr = abs(tp - current) / abs(current - sl)
+
+    if rr < 2.8:
+
+        return None
+
+    # =====================================================
+
+    # ANTI SPAM
+
+    # =====================================================
+
+    signal_id = f"{symbol}_{side}"
+
+    now = time.time()
+
+    if signal_id in bot.sent_signals:
+
+        last = bot.sent_signals[signal_id]
+
+        if now - last < (ANTI_SPAM_MINUTES * 60):
+
+            return None
+
+    bot.sent_signals[signal_id] = now
+
+    # =====================================================
+
+    # SIGNAL
+
+    # =====================================================
+
+    duration = "6-24 годин"
+
+    confidence = min(score * 10, 95)
+
+    text = (
+
+        f"🚨 *INTRADAY SIGNAL*\n\n"
+
+        f"💎 Монета: `{symbol}`\n"
+
+        f"📊 Тип: `{side}`\n"
+
+        f"⚡ Сетап: `{signal_type}`\n\n"
+
+        f"💰 Вхід: `{round(current, 5)}`\n"
+
+        f"🎯 Take Profit: `{round(tp, 5)}`\n"
+
+        f"🛑 Stop Loss: `{round(sl, 5)}`\n\n"
+
+        f"📈 R:R: `1:3`\n"
+
+        f"🔥 Confidence: `{confidence}%`\n"
+
+        f"📦 Очікуваний час: `{duration}`\n\n"
+
+        f"📊 Причина входу:\n"
+
+        f"• Volume x{round(volume_ratio,1)}\n"
+
+        f"• Momentum {round(momentum,2)}%\n"
+
+        f"• Volatility {round(volatility,2)}%\n"
+
+        f"• EMA Trend підтверджено\n\n"
+
+        f"⚠️ Risk: 1-2% від депозиту"
+
+    )
+
+    bot.stats["signals"] += 1
+
+    bot.stats["last"] = symbol
+
+    if signal_type in ["PUMP", "DUMP"]:
+
+        bot.stats["pump"] += 1
+
+    else:
+
+        bot.stats["smart"] += 1
+
+    bot.active_trades[symbol] = {
+
+        "side": side,
+
+        "entry": current,
+
+        "tp": tp,
+
+        "sl": sl
+
+    }
+
+    return text
+
+# =========================================================
+
+#                RESULTS CHECKER
+
+# =========================================================
+
+def check_trade_results():
+
+    while True:
 
         try:
 
-            r = requests.get(
+            remove_list = []
 
-                f"{BINANCE}/api/v3/klines",
+            for symbol, trade in bot.active_trades.items():
 
-                params={
+                price = get_price(symbol)
 
-                    "symbol": symbol,
+                if not price:
 
-                    "interval": interval,
+                    continue
 
-                    "limit": limit
+                side = trade["side"]
 
-                },
+                tp = trade["tp"]
 
-                timeout=10
+                sl = trade["sl"]
 
-            )
+                result = None
 
-            if r.status_code != 200:
+                if side == "LONG":
 
-                return None
+                    if price >= tp:
 
-            return r.json()
+                        result = "WIN"
 
-        except:
+                    elif price <= sl:
 
-            return None
+                        result = "LOSS"
 
-    # =====================================================
+                else:
 
-    # EMA
+                    if price <= tp:
 
-    # =====================================================
+                        result = "WIN"
 
-    def ema(self, data, period):
+                    elif price >= sl:
 
-        if len(data) < period:
+                        result = "LOSS"
 
-            return None
+                if result:
 
-        multiplier = 2 / (period + 1)
+                    bot.closed_trades.append({
 
-        ema = mean(data[:period])
+                        "symbol": symbol,
 
-        for price in data[period:]:
+                        "result": result
 
-            ema = ((price - ema) * multiplier) + ema
+                    })
 
-        return ema
+                    if result == "WIN":
 
-    # =====================================================
+                        bot.stats["wins"] += 1
 
-    # RSI
+                    else:
 
-    # =====================================================
+                        bot.stats["losses"] += 1
 
-    def rsi(self, closes, period=14):
+                    emoji = "✅" if result == "WIN" else "❌"
 
-        gains = []
+                    send_message(
 
-        losses = []
+                        f"{emoji} `{symbol}` закрито: *{result}*"
 
-        for i in range(-period, -1):
+                    )
 
-            diff = closes[i] - closes[i - 1]
+                    remove_list.append(symbol)
 
-            if diff > 0:
+            for symbol in remove_list:
 
-                gains.append(diff)
+                del bot.active_trades[symbol]
 
-            else:
+        except Exception as e:
 
-                losses.append(abs(diff))
+            print(e)
 
-        avg_gain = mean(gains) if gains else 0.001
-
-        avg_loss = mean(losses) if losses else 0.001
-
-        rs = avg_gain / avg_loss
-
-        return 100 - (100 / (1 + rs))
-
-    # =====================================================
-
-    # MAIN ANALYSIS
-
-    # =====================================================
-
-    def analyze(self, symbol):
-
-        # =================================================
-
-        # MULTI TIMEFRAME
-
-        # =================================================
-
-        data_15m = self.get_klines(symbol, "15m")
-
-        data_1h = self.get_klines(symbol, "1h")
-
-        if not data_15m or not data_1h:
-
-            return None
-
-        closes = [float(x[4]) for x in data_15m]
-
-        highs = [float(x[2]) for x in data_15m]
-
-        lows = [float(x[3]) for x in data_15m]
-
-        volumes = [float(x[5]) for x in data_15m]
-
-        closes_1h = [float(x[4]) for x in data_1h]
-
-        current = closes[-1]
-
-        # =================================================
-
-        # TREND FILTER
-
-        # =================================================
-
-        ema20 = self.ema(closes_1h, 20)
-
-        ema50 = self.ema(closes_1h, 50)
-
-        if not ema20 or not ema50:
-
-            return None
-
-        bullish = ema20 > ema50
-
-        bearish = ema20 < ema50
-
-        # =================================================
-
-        # VOLUME FILTER
-
-        # =================================================
-
-        avg_volume = mean(volumes[-25:])
-
-        volume_spike = volumes[-1] > avg_volume * 2.5
-
-        if not volume_spike:
-
-            return None
-
-        # =================================================
-
-        # MOMENTUM FILTER
-
-        # =================================================
-
-        impulse = (
-
-            (closes[-1] - closes[-5])
-
-            / closes[-5]
-
-        ) * 100
-
-        long_impulse = impulse > 2.3
-
-        short_impulse = impulse < -2.3
-
-        # =================================================
-
-        # VOLATILITY FILTER
-
-        # =================================================
-
-        volatility = (
-
-            (max(highs[-20:]) - min(lows[-20:]))
-
-            / current
-
-        ) * 100
-
-        if volatility < 3:
-
-            return None
-
-        # =================================================
-
-        # LIQUIDITY SWEEP
-
-        # =================================================
-
-        recent_high = max(highs[-30:-1])
-
-        recent_low = min(lows[-30:-1])
-
-        sweep_low = lows[-1] < recent_low
-
-        sweep_high = highs[-1] > recent_high
-
-        # =================================================
-
-        # RSI
-
-        # =================================================
-
-        rsi = self.rsi(closes)
-
-        # =================================================
-
-        # LONG SCORE
-
-        # =================================================
-
-        long_score = 0
-
-        long_reasons = []
-
-        if bullish:
-
-            long_score += 2
-
-            long_reasons.append("1H bullish trend")
-
-        if long_impulse:
-
-            long_score += 3
-
-            long_reasons.append("Strong bullish impulse")
-
-        if volume_spike:
-
-            long_score += 2
-
-            long_reasons.append("Volume spike")
-
-        if sweep_low:
-
-            long_score += 2
-
-            long_reasons.append("Liquidity sweep")
-
-        if 45 < rsi < 70:
-
-            long_score += 1
-
-            long_reasons.append("Healthy RSI")
-
-        # =================================================
-
-        # SHORT SCORE
-
-        # =================================================
-
-        short_score = 0
-
-        short_reasons = []
-
-        if bearish:
-
-            short_score += 2
-
-            short_reasons.append("1H bearish trend")
-
-        if short_impulse:
-
-            short_score += 3
-
-            short_reasons.append("Strong bearish impulse")
-
-        if volume_spike:
-
-            short_score += 2
-
-            short_reasons.append("Volume spike")
-
-        if sweep_high:
-
-            short_score += 2
-
-            short_reasons.append("Liquidity sweep")
-
-        if 30 < rsi < 55:
-
-            short_score += 1
-
-            short_reasons.append("Healthy RSI")
-
-        # =================================================
-
-        # FINAL DECISION
-
-        # =================================================
-
-        direction = None
-
-        score = 0
-
-        reasons = []
-
-        if long_score >= MIN_SCORE and long_score > short_score:
-
-            direction = "LONG"
-
-            score = long_score
-
-            reasons = long_reasons
-
-        elif short_score >= MIN_SCORE and short_score > long_score:
-
-            direction = "SHORT"
-
-            score = short_score
-
-            reasons = short_reasons
-
-        else:
-
-            return None
-
-        # =================================================
-
-        # ANTI SPAM
-
-        # =================================================
-
-        signal_hash = hashlib.md5(
-
-            f"{symbol}{direction}".encode()
-
-        ).hexdigest()
-
-        now = time.time()
-
-        if signal_hash in self.sent_signals:
-
-            if now - self.sent_signals[signal_hash] < SIGNAL_COOLDOWN:
-
-                return None
-
-        self.sent_signals[signal_hash] = now
-
-        # =================================================
-
-        # TAKE PROFIT / STOP LOSS
-
-        # =================================================
-
-        if direction == "LONG":
-
-            sl = min(lows[-12:]) * 0.998
-
-            risk = current - sl
-
-            tp = current + (risk * 3)
-
-        else:
-
-            sl = max(highs[-12:]) * 1.002
-
-            risk = sl - current
-
-            tp = current - (risk * 3)
-
-        # =================================================
-
-        # TP DISTANCE FILTER
-
-        # =================================================
-
-        tp_distance = abs((tp - current) / current) * 100
-
-        if tp_distance < 3:
-
-            return None
-
-        # =================================================
-
-        # CONFIDENCE
-
-        # =================================================
-
-        confidence = min(96, 76 + score * 2)
-
-        # =================================================
-
-        # SETUP TYPE
-
-        # =================================================
-
-        setup_type = (
-
-            "⚡ Pump / Momentum"
-
-            if abs(impulse) > 3
-
-            else "📈 Smart Money Intraday"
-
-        )
-
-        # =================================================
-
-        # DURATION
-
-        # =================================================
-
-        if abs(impulse) > 4:
-
-            duration = "2-6 годин"
-
-        else:
-
-            duration = "6-24 години"
-
-        # =================================================
-
-        # STATS
-
-        # =================================================
-
-        self.stats["signals"] += 1
-
-        self.stats["last_signal"] = symbol
-
-        # =================================================
-
-        # FINAL MESSAGE
-
-        # =================================================
-
-        text = f"""
-
-🔥 *PREMIUM FUTURES SIGNAL*
-
-💎 Pair:
-
-`{symbol}`
-
-📊 Direction:
-
-`{direction}`
-
-⚡ Setup:
-
-{setup_type}
-
-💰 Entry:
-
-`{round(current, 6)}`
-
-🛑 Stop Loss:
-
-`{round(sl, 6)}`
-
-🎯 Take Profit:
-
-`{round(tp, 6)}`
-
-📈 Confidence:
-
-*{confidence}%*
-
-⏳ Expected Duration:
-
-`{duration}`
-
-━━━━━━━━━━━━━━━
-
-🧠 Confirmations:
-
-"""
-
-        for r in reasons:
-
-            text += f"\n• {r}"
-
-        text += """
-
-━━━━━━━━━━━━━━━
-
-📌 Risk Reward:
-
-1:3
-
-🛡 Anti-Spam:
-
-Enabled
-
-💡 Position Type:
-
-Intraday Futures
-
-"""
-
-        return text
+        time.sleep(30)
 
 # =========================================================
 
-# BOT INSTANCE
+#                SCANNER
 
 # =========================================================
 
-bot = FuturesBot()
-
-# =========================================================
-
-# MARKET SCANNER
-
-# =========================================================
-
-def market_scanner():
+def scanner():
 
     send_message(
 
-        "🚀 *FUTURES INTRADAY BOT ACTIVATED*\n"
+        "🚀 *Intraday Ultra v9 FINAL ACTIVE*\n\n"
 
-        "🔍 Scanning Binance Futures Market\n"
+        "✅ Smart Money\n"
 
-        "⚡ High Quality Mode Enabled"
+        "✅ Pump/Dump\n"
+
+        "✅ Anti-Spam\n"
+
+        "✅ Intraday only\n"
+
+        "✅ High Confidence Filter"
 
     )
 
@@ -648,97 +558,91 @@ def market_scanner():
 
         try:
 
-            tickers = requests.get(
+            url = f"{BINANCE_URL}/fapi/v1/ticker/24hr"
 
-                f"{BINANCE}/api/v3/ticker/24hr",
+            tickers = requests.get(url, timeout=15).json()
 
-                timeout=15
-
-            ).json()
-
-            filtered = []
+            coins = []
 
             for t in tickers:
 
-                try:
+                symbol = t["symbol"]
 
-                    symbol = t["symbol"]
-
-                    if not symbol.endswith("USDT"):
-
-                        continue
-
-                    volume = float(t["quoteVolume"])
-
-                    change = abs(float(t["priceChangePercent"]))
-
-                    # FILTER LOW QUALITY
-
-                    if volume < MIN_VOLUME:
-
-                        continue
-
-                    if change < 2:
-
-                        continue
-
-                    filtered.append(t)
-
-                except:
+                if not symbol.endswith("USDT"):
 
                     continue
 
-            # =================================================
+                volume = float(t["quoteVolume"])
 
-            # SORT BY VOLUME
+                if volume < MIN_VOLUME_USDT:
 
-            # =================================================
+                    continue
 
-            filtered = sorted(
+                change = abs(float(t["priceChangePercent"]))
 
-                filtered,
+                if change < 2:
 
-                key=lambda x: float(x["quoteVolume"]),
+                    continue
+
+                coins.append({
+
+                    "symbol": symbol,
+
+                    "volume": volume,
+
+                    "change": change
+
+                })
+
+            coins = sorted(
+
+                coins,
+
+                key=lambda x: x["volume"],
 
                 reverse=True
 
-            )[:MAX_COINS]
+            )[:TOP_COINS_LIMIT]
 
-            # =================================================
+            symbols = (
 
-            # ANALYZE
+                bot.watchlist
 
-            # =================================================
+                if bot.watchlist
 
-            for coin in filtered:
+                else [x["symbol"] for x in coins]
 
-                symbol = coin["symbol"]
+            )
 
-                signal = bot.analyze(symbol)
+            for symbol in symbols:
 
-                if signal:
+                try:
 
-                    send_message(signal)
+                    signal = analyze_symbol(symbol)
 
-                time.sleep(0.7)
+                    if signal:
 
-            print("SCAN FINISHED")
+                        send_message(signal)
 
-            time.sleep(SCAN_INTERVAL)
+                    time.sleep(1)
+
+                except Exception as e:
+
+                    print(symbol, e)
 
         except Exception as e:
 
-            print("SCAN ERROR:", e)
+            print(e)
 
-            time.sleep(15)
-
-# =========================================================
-
-# TELEGRAM COMMANDS
+        time.sleep(SCAN_INTERVAL)
 
 # =========================================================
 
-def telegram_commands():
+#                TELEGRAM COMMANDS
+
+# =========================================================
+
+def telegram_bot():
 
     last_update = 0
 
@@ -750,107 +654,247 @@ def telegram_commands():
 
                 f"https://api.telegram.org/bot{TOKEN}"
 
-                f"/getUpdates?offset={last_update + 1}&timeout=30"
+                f"/getUpdates?offset={last_update+1}&timeout=30"
 
             )
 
-            res = requests.get(url, timeout=35).json()
+            updates = requests.get(url, timeout=40).json()
 
-            for update in res.get("result", []):
+            for update in updates.get("result", []):
 
                 last_update = update["update_id"]
 
                 msg = update.get("message", {})
 
-                text = msg.get("text", "").lower()
+                text = msg.get("text", "")
 
-                # =================================================
+                # =========================================
 
-                if text in ["/status", "📊 статус"]:
+                # STATUS
+
+                # =========================================
+
+                if text == "/status":
 
                     send_message(
 
-                        f"""
+                        f"⚙️ *Статус системи*\n\n"
 
-📊 *BOT STATUS*
+                        f"✅ Binance Futures ACTIVE\n"
 
-✅ Scanner: ACTIVE
+                        f"✅ Scanner ONLINE\n"
 
-✅ Smart Money: ENABLED
+                        f"✅ Signals ACTIVE\n"
 
-✅ Intraday Mode: ENABLED
+                        f"✅ Anti-Spam ACTIVE\n\n"
 
-✅ Anti-Spam: ENABLED
+                        f"📊 Активних угод: "
 
-📈 Signals:
-
-`{bot.stats["signals"]}`
-
-💎 Last Signal:
-
-`{bot.stats["last_signal"]}`
-
-⚡ Strategy:
-
-Intraday Momentum + SMC
-
-"""
+                        f"{len(bot.active_trades)}"
 
                     )
 
-                # =================================================
+                # =========================================
 
-                elif text in ["/logic", "🧠 логіка"]:
+                # STATS
+
+                # =========================================
+
+                elif text == "/stats":
+
+                    total = (
+
+                        bot.stats["wins"] +
+
+                        bot.stats["losses"]
+
+                    )
+
+                    wr = 0
+
+                    if total > 0:
+
+                        wr = round(
+
+                            (bot.stats["wins"] / total) * 100,
+
+                            1
+
+                        )
 
                     send_message(
 
-                        """
+                        f"🏆 *Intraday Ultra v9*\n\n"
 
-🧠 *CURRENT BOT LOGIC*
+                        f"📈 Signals: {bot.stats['signals']}\n"
 
-✅ Full Binance scan
+                        f"✅ Wins: {bot.stats['wins']}\n"
 
-✅ Smart Money concepts
+                        f"❌ Losses: {bot.stats['losses']}\n"
 
-✅ Liquidity sweeps
+                        f"🎯 WinRate: {wr}%\n\n"
 
-✅ Momentum entries
+                        f"⚡ Pump/Dump: {bot.stats['pump']}\n"
 
-✅ Volume confirmation
+                        f"💎 Smart Money: {bot.stats['smart']}\n\n"
 
-✅ Trend confirmation
+                        f"📦 Last: {bot.stats['last']}"
 
-✅ Intraday signals
+                    )
 
-✅ High liquidity only
+                # =========================================
 
-✅ Volatility filter
+                # RESULT
 
-✅ RSI filter
+                # =========================================
 
-✅ 1:3 Risk Reward
+                elif text == "/result":
 
-✅ Anti-spam system
+                    wins = len([
 
-🚫 Weak setups ignored
+                        x for x in bot.closed_trades
 
-🚫 Low volume ignored
+                        if x["result"] == "WIN"
 
-🚫 Sideways market ignored
+                    ])
 
-"""
+                    losses = len([
+
+                        x for x in bot.closed_trades
+
+                        if x["result"] == "LOSS"
+
+                    ])
+
+                    total = wins + losses
+
+                    wr = 0
+
+                    if total > 0:
+
+                        wr = round((wins / total) * 100, 1)
+
+                    send_message(
+
+                        f"📊 *Результати*\n\n"
+
+                        f"✅ WIN: {wins}\n"
+
+                        f"❌ LOSS: {losses}\n"
+
+                        f"🎯 WR: {wr}%"
+
+                    )
+
+                # =========================================
+
+                # WATCHLIST
+
+                # =========================================
+
+                elif text.startswith("/watch"):
+
+                    parts = text.split()
+
+                    if len(parts) > 1:
+
+                        coin = parts[1].upper()
+
+                        if not coin.endswith("USDT"):
+
+                            coin += "USDT"
+
+                        if coin not in bot.watchlist:
+
+                            bot.watchlist.append(coin)
+
+                            send_message(
+
+                                f"✅ {coin} додано"
+
+                            )
+
+                        else:
+
+                            send_message(
+
+                                "⚠️ Уже є"
+
+                            )
+
+                    else:
+
+                        if bot.watchlist:
+
+                            wl = "\n".join(
+
+                                [f"• {x}" for x in bot.watchlist]
+
+                            )
+
+                            send_message(
+
+                                f"👁 Watchlist:\n\n{wl}"
+
+                            )
+
+                        else:
+
+                            send_message(
+
+                                "👁 Watchlist порожній"
+
+                            )
+
+                # =========================================
+
+                # VERSION
+
+                # =========================================
+
+                elif text == "/version":
+
+                    send_message(
+
+                        "🚀 Intraday Ultra v9 FINAL ACTIVE"
+
+                    )
+
+                # =========================================
+
+                # HELP
+
+                # =========================================
+
+                elif text == "/help":
+
+                    send_message(
+
+                        "📚 Команди:\n\n"
+
+                        "/status\n"
+
+                        "/stats\n"
+
+                        "/result\n"
+
+                        "/watch BTCUSDT\n"
+
+                        "/version\n"
+
+                        "/help"
 
                     )
 
         except Exception as e:
 
-            print("TG ERROR:", e)
+            print(e)
 
-            time.sleep(5)
+        time.sleep(2)
 
 # =========================================================
 
-# START
+#                MAIN
 
 # =========================================================
 
@@ -864,18 +908,16 @@ if __name__ == "__main__":
 
             port=int(os.environ.get("PORT", 8080))
 
-        ),
-
-        daemon=True
+        )
 
     ).start()
+
+    threading.Thread(target=scanner).start()
 
     threading.Thread(
 
-        target=market_scanner,
-
-        daemon=True
+        target=check_trade_results
 
     ).start()
 
-    telegram_commands()
+    telegram_bot()
