@@ -1,0 +1,1233 @@
+# =========================================================
+
+# 🔥 AEGIS ULTRA INTRADAY BOT v13 FINAL
+
+# Binance Futures Smart Money Bot
+
+# FULL SERVER VERSION FOR REPLIT / VPS
+
+# =========================================================
+
+# =========================================================
+
+# 📦 INSTALL
+
+# =========================================================
+
+# pip install python-telegram-bot==13.15
+
+# pip install ccxt pandas ta requests numpy
+
+# =========================================================
+
+# 🔐 TELEGRAM CONFIG
+
+# =========================================================
+
+BOT_TOKEN = "PASTE_BOT_TOKEN"
+
+CHAT_ID = "PASTE_CHAT_ID"
+
+# =========================================================
+
+# ⚙️ IMPORTS
+
+# =========================================================
+
+import ccxt
+
+import pandas as pd
+
+import ta
+
+import time
+
+import threading
+
+from datetime import datetime, timedelta
+
+from telegram import ReplyKeyboardMarkup
+
+from telegram.ext import (
+
+    Updater,
+
+    MessageHandler,
+
+    Filters
+
+)
+
+# =========================================================
+
+# ⚙️ SETTINGS
+
+# =========================================================
+
+TIMEFRAMES = {
+
+    "entry": "15m",
+
+    "trend": "1h",
+
+    "macro": "4h"
+
+}
+
+MIN_VOLUME_USDT = 25000000
+
+MIN_CONFIDENCE = 84
+
+MAX_SIGNALS_PER_DAY = 6
+
+ANTI_SPAM_MINUTES = 90
+
+RISK_REWARD = 3
+
+ATR_SL_MULTIPLIER = 1.4
+
+ATR_TP_MULTIPLIER = 4.2
+
+MIN_TP_DISTANCE = 7
+
+MAX_TP_DISTANCE = 18
+
+SCAN_DELAY = 120
+
+MAX_ACTIVE_TRADES = 5
+
+# =========================================================
+
+# 📊 GLOBAL STORAGE
+
+# =========================================================
+
+sent_signals = {}
+
+active_trades = []
+
+trade_history = []
+
+daily_signals = 0
+
+stats = {
+
+    "wins": 0,
+
+    "losses": 0,
+
+    "total": 0
+
+}
+
+# =========================================================
+
+# 🌐 BINANCE FUTURES
+
+# =========================================================
+
+exchange = ccxt.binance({
+
+    "enableRateLimit": True,
+
+    "options": {
+
+        "defaultType": "future"
+
+    }
+
+})
+
+# =========================================================
+
+# 🤖 TELEGRAM
+
+# =========================================================
+
+updater = Updater(BOT_TOKEN, use_context=True)
+
+bot = updater.bot
+
+keyboard = [
+
+    ["📊 Статус", "📈 Активні"],
+
+    ["🏆 Звіт", "📜 Останні"],
+
+    ["📅 Тиждень", "🏓 Пінг"]
+
+]
+
+reply_markup = ReplyKeyboardMarkup(
+
+    keyboard,
+
+    resize_keyboard=True
+
+)
+
+# =========================================================
+
+# 📩 SEND MESSAGE
+
+# =========================================================
+
+def send_message(text):
+
+    try:
+
+        bot.send_message(
+
+            chat_id=CHAT_ID,
+
+            text=text,
+
+            parse_mode="HTML",
+
+            reply_markup=reply_markup
+
+        )
+
+    except Exception as e:
+
+        print("Telegram Error:", e)
+
+# =========================================================
+
+# 📊 MARKET DATA
+
+# =========================================================
+
+def get_ohlcv(symbol, timeframe="15m", limit=200):
+
+    try:
+
+        data = exchange.fetch_ohlcv(
+
+            symbol,
+
+            timeframe=timeframe,
+
+            limit=limit
+
+        )
+
+        df = pd.DataFrame(data, columns=[
+
+            "time",
+
+            "open",
+
+            "high",
+
+            "low",
+
+            "close",
+
+            "volume"
+
+        ])
+
+        return df
+
+    except:
+
+        return None
+
+# =========================================================
+
+# 🧠 SMART MONEY ANALYSIS
+
+# =========================================================
+
+def analyze_symbol(symbol):
+
+    confirmations = []
+
+    confidence = 0
+
+    try:
+
+        # =================================================
+
+        # MULTI TF DATA
+
+        # =================================================
+
+        df15 = get_ohlcv(symbol, "15m")
+
+        df1h = get_ohlcv(symbol, "1h")
+
+        df4h = get_ohlcv(symbol, "4h")
+
+        if (
+
+            df15 is None or
+
+            df1h is None or
+
+            df4h is None
+
+        ):
+
+            return None
+
+        # =================================================
+
+        # LIQUIDITY FILTER
+
+        # =================================================
+
+        ticker = exchange.fetch_ticker(symbol)
+
+        volume = ticker["quoteVolume"]
+
+        if volume < MIN_VOLUME_USDT:
+
+            return None
+
+        confirmations.append(
+
+            f"✅ Ліквідність ${round(volume/1000000,1)}M"
+
+        )
+
+        confidence += 10
+
+        # =================================================
+
+        # EMA TREND
+
+        # =================================================
+
+        for df in [df15, df1h, df4h]:
+
+            df["ema20"] = ta.trend.ema_indicator(
+
+                df["close"],
+
+                20
+
+            )
+
+            df["ema50"] = ta.trend.ema_indicator(
+
+                df["close"],
+
+                50
+
+            )
+
+        long_trend = (
+
+            df15["ema20"].iloc[-1] >
+
+            df15["ema50"].iloc[-1]
+
+            and
+
+            df1h["ema20"].iloc[-1] >
+
+            df1h["ema50"].iloc[-1]
+
+            and
+
+            df4h["ema20"].iloc[-1] >
+
+            df4h["ema50"].iloc[-1]
+
+        )
+
+        short_trend = (
+
+            df15["ema20"].iloc[-1] <
+
+            df15["ema50"].iloc[-1]
+
+            and
+
+            df1h["ema20"].iloc[-1] <
+
+            df1h["ema50"].iloc[-1]
+
+            and
+
+            df4h["ema20"].iloc[-1] <
+
+            df4h["ema50"].iloc[-1]
+
+        )
+
+        if not long_trend and not short_trend:
+
+            return None
+
+        direction = "LONG" if long_trend else "SHORT"
+
+        confirmations.append(
+
+            "✅ Multi-TF Trend"
+
+        )
+
+        confidence += 20
+
+        # =================================================
+
+        # RSI FILTER
+
+        # =================================================
+
+        df15["rsi"] = ta.momentum.rsi(
+
+            df15["close"],
+
+            14
+
+        )
+
+        rsi = df15["rsi"].iloc[-1]
+
+        if direction == "LONG" and rsi > 72:
+
+            return None
+
+        if direction == "SHORT" and rsi < 28:
+
+            return None
+
+        confirmations.append(
+
+            f"✅ RSI {round(rsi,1)}"
+
+        )
+
+        confidence += 10
+
+        # =================================================
+
+        # VOLUME SPIKE
+
+        # =================================================
+
+        avg_volume = df15["volume"].tail(20).mean()
+
+        current_volume = df15["volume"].iloc[-1]
+
+        volume_ratio = current_volume / avg_volume
+
+        if volume_ratio < 2:
+
+            return None
+
+        confirmations.append(
+
+            f"✅ Volume x{round(volume_ratio,1)}"
+
+        )
+
+        confidence += 15
+
+        # =================================================
+
+        # IMPULSE DETECTION
+
+        # =================================================
+
+        move = (
+
+            (
+
+                df15["close"].iloc[-1]
+
+                -
+
+                df15["close"].iloc[-5]
+
+            )
+
+            /
+
+            df15["close"].iloc[-5]
+
+        ) * 100
+
+        if direction == "LONG":
+
+            if move < 2:
+
+                return None
+
+        if direction == "SHORT":
+
+            if move > -2:
+
+                return None
+
+        confirmations.append(
+
+            "✅ Імпульс підтверджено"
+
+        )
+
+        confidence += 15
+
+        # =================================================
+
+        # NOT END OF MOVE
+
+        # =================================================
+
+        closes = df15["close"].tail(3).values
+
+        if direction == "LONG":
+
+            if closes[-1] < closes[-2]:
+
+                return None
+
+        if direction == "SHORT":
+
+            if closes[-1] > closes[-2]:
+
+                return None
+
+        confirmations.append(
+
+            "✅ НЕ кінець руху"
+
+        )
+
+        confidence += 12
+
+        # =================================================
+
+        # ATR TP/SL LOGIC
+
+        # =================================================
+
+        atr = ta.volatility.average_true_range(
+
+            df15["high"],
+
+            df15["low"],
+
+            df15["close"],
+
+            14
+
+        ).iloc[-1]
+
+        entry = df15["close"].iloc[-1]
+
+        if direction == "LONG":
+
+            sl = entry - (atr * ATR_SL_MULTIPLIER)
+
+            tp = entry + (atr * ATR_TP_MULTIPLIER)
+
+        else:
+
+            sl = entry + (atr * ATR_SL_MULTIPLIER)
+
+            tp = entry - (atr * ATR_TP_MULTIPLIER)
+
+        tp_percent = abs(
+
+            ((tp - entry) / entry) * 100
+
+        )
+
+        if tp_percent < MIN_TP_DISTANCE:
+
+            return None
+
+        if tp_percent > MAX_TP_DISTANCE:
+
+            return None
+
+        # =================================================
+
+        # CONFIDENCE FILTER
+
+        # =================================================
+
+        if confidence < MIN_CONFIDENCE:
+
+            return None
+
+        # =================================================
+
+        # ANTI SPAM
+
+        # =================================================
+
+        now = datetime.utcnow()
+
+        if symbol in sent_signals:
+
+            diff = now - sent_signals[symbol]
+
+            if (
+
+                diff.total_seconds()
+
+                <
+
+                ANTI_SPAM_MINUTES * 60
+
+            ):
+
+                return None
+
+        sent_signals[symbol] = now
+
+        # =================================================
+
+        # ACTIVE TRADES LIMIT
+
+        # =================================================
+
+        if len(active_trades) >= MAX_ACTIVE_TRADES:
+
+            return None
+
+        # =================================================
+
+        # SIGNAL OBJECT
+
+        # =================================================
+
+        signal = {
+
+            "symbol": symbol,
+
+            "direction": direction,
+
+            "entry": round(entry, 6),
+
+            "sl": round(sl, 6),
+
+            "tp": round(tp, 6),
+
+            "confidence": confidence,
+
+            "confirmations": confirmations,
+
+            "time": now.strftime(
+
+                "%Y-%m-%d %H:%M"
+
+            )
+
+        }
+
+        return signal
+
+    except:
+
+        return None
+
+# =========================================================
+
+# 🚀 SEND SIGNAL
+
+# =========================================================
+
+def send_signal(signal):
+
+    global daily_signals
+
+    daily_signals += 1
+
+    text = f"""
+
+🔥 <b>PREMIUM INTRADAY SIGNAL</b>
+
+💎 Пара: <b>{signal['symbol']}</b>
+
+📍 Напрямок: <b>{signal['direction']}</b>
+
+━━━━━━━━━━━━━━
+
+💰 Entry: <b>{signal['entry']}</b>
+
+🛑 Stop Loss:
+
+<b>{signal['sl']}</b>
+
+🎯 Take Profit:
+
+<b>{signal['tp']}</b>
+
+━━━━━━━━━━━━━━
+
+📊 Confidence:
+
+<b>{signal['confidence']}%</b>
+
+⚖️ RR:
+
+<b>1:{RISK_REWARD}</b>
+
+━━━━━━━━━━━━━━
+
+🧠 Підтвердження:
+
+{chr(10).join(signal['confirmations'])}
+
+━━━━━━━━━━━━━━
+
+⏰ Intraday Signal
+
+📌 Binance Futures
+
+"""
+
+    send_message(text)
+
+    active_trades.append(signal)
+
+# =========================================================
+
+# 📊 CHECK ACTIVE TRADES
+
+# =========================================================
+
+def check_active_trades():
+
+    closed = []
+
+    for trade in active_trades:
+
+        try:
+
+            ticker = exchange.fetch_ticker(
+
+                trade["symbol"]
+
+            )
+
+            price = ticker["last"]
+
+            result = None
+
+            if trade["direction"] == "LONG":
+
+                if price >= trade["tp"]:
+
+                    result = "WIN"
+
+                elif price <= trade["sl"]:
+
+                    result = "LOSS"
+
+            else:
+
+                if price <= trade["tp"]:
+
+                    result = "WIN"
+
+                elif price >= trade["sl"]:
+
+                    result = "LOSS"
+
+            if result:
+
+                trade["result"] = result
+
+                trade["close_time"] = datetime.utcnow(
+
+                ).strftime("%Y-%m-%d %H:%M")
+
+                trade_history.append(trade)
+
+                stats["total"] += 1
+
+                if result == "WIN":
+
+                    stats["wins"] += 1
+
+                else:
+
+                    stats["losses"] += 1
+
+                send_message(
+
+                    f"""
+
+📌 {trade['symbol']}
+
+{trade['direction']}
+
+{"✅ TAKE PROFIT HIT" if result=="WIN" else "❌ STOP LOSS HIT"}
+
+"""
+
+                )
+
+                closed.append(trade)
+
+        except:
+
+            pass
+
+    for c in closed:
+
+        active_trades.remove(c)
+
+# =========================================================
+
+# 📊 REPORTS
+
+# =========================================================
+
+def get_report():
+
+    total = stats["total"]
+
+    if total == 0:
+
+        winrate = 0
+
+    else:
+
+        winrate = round(
+
+            (stats["wins"] / total) * 100,
+
+            1
+
+        )
+
+    return f"""
+
+🏆 <b>ЗВІТ БОТА</b>
+
+📊 Всього угод:
+
+<b>{total}</b>
+
+✅ Прибуткових:
+
+<b>{stats['wins']}</b>
+
+❌ Збиткових:
+
+<b>{stats['losses']}</b>
+
+🎯 WinRate:
+
+<b>{winrate}%</b>
+
+📈 Активних:
+
+<b>{len(active_trades)}</b>
+
+⚖️ RR:
+
+<b>1:{RISK_REWARD}</b>
+
+🧠 Стратегія:
+
+Smart Money +
+
+Multi TF +
+
+Volume +
+
+Impulse
+
+📌 Binance Futures
+
+"""
+
+# =========================================================
+
+# 📅 WEEK REPORT
+
+# =========================================================
+
+def get_week_report():
+
+    if not trade_history:
+
+        return "📅 За тиждень угод ще немає."
+
+    recent = trade_history[-20:]
+
+    text = "📅 <b>Тижневий звіт</b>\n\n"
+
+    for t in recent:
+
+        emoji = (
+
+            "✅"
+
+            if t["result"] == "WIN"
+
+            else
+
+            "❌"
+
+        )
+
+        text += (
+
+            f"{emoji} "
+
+            f"{t['symbol']} "
+
+            f"{t['direction']} "
+
+            f"{t['result']}\n"
+
+        )
+
+    return text
+
+# =========================================================
+
+# 📜 LAST TRADES
+
+# =========================================================
+
+def get_last_trades():
+
+    if not trade_history:
+
+        return "📜 Немає останніх угод."
+
+    recent = trade_history[-10:]
+
+    text = "📜 <b>Останні угоди</b>\n\n"
+
+    for t in recent:
+
+        emoji = (
+
+            "✅"
+
+            if t["result"] == "WIN"
+
+            else
+
+            "❌"
+
+        )
+
+        text += (
+
+            f"{emoji} "
+
+            f"{t['symbol']} "
+
+            f"{t['direction']} "
+
+            f"{t['result']}\n"
+
+        )
+
+    return text
+
+# =========================================================
+
+# 🤖 TELEGRAM COMMANDS
+
+# =========================================================
+
+def handle_message(update, context):
+
+    text = update.message.text.lower()
+
+    # =====================================================
+
+    # STATUS
+
+    # =====================================================
+
+    if "статус" in text:
+
+        total = stats["total"]
+
+        if total == 0:
+
+            wr = 0
+
+        else:
+
+            wr = round(
+
+                (stats["wins"]/total)*100,
+
+                1
+
+            )
+
+        update.message.reply_text(
+
+            f"""
+
+📊 Сигналів сьогодні:
+
+{daily_signals}/{MAX_SIGNALS_PER_DAY}
+
+📈 Активних угод:
+
+{len(active_trades)}/{MAX_ACTIVE_TRADES}
+
+✅ Wins:
+
+{stats['wins']}
+
+❌ Losses:
+
+{stats['losses']}
+
+🎯 WinRate:
+
+{wr}%
+
+""",
+
+            reply_markup=reply_markup
+
+        )
+
+    # =====================================================
+
+    # ACTIVE TRADES
+
+    # =====================================================
+
+    elif "активні" in text:
+
+        if not active_trades:
+
+            update.message.reply_text(
+
+                "📈 Активних угод немає.",
+
+                reply_markup=reply_markup
+
+            )
+
+        else:
+
+            msg = "📈 АКТИВНІ УГОДИ\n\n"
+
+            for t in active_trades:
+
+                msg += (
+
+                    f"• {t['symbol']} "
+
+                    f"{t['direction']}\n"
+
+                    f"TP: {t['tp']}\n"
+
+                    f"SL: {t['sl']}\n\n"
+
+                )
+
+            update.message.reply_text(
+
+                msg,
+
+                reply_markup=reply_markup
+
+            )
+
+    # =====================================================
+
+    # REPORT
+
+    # =====================================================
+
+    elif "звіт" in text:
+
+        update.message.reply_text(
+
+            get_report(),
+
+            parse_mode="HTML",
+
+            reply_markup=reply_markup
+
+        )
+
+    # =====================================================
+
+    # WEEK REPORT
+
+    # =====================================================
+
+    elif "тиждень" in text:
+
+        update.message.reply_text(
+
+            get_week_report(),
+
+            parse_mode="HTML",
+
+            reply_markup=reply_markup
+
+        )
+
+    # =====================================================
+
+    # LAST TRADES
+
+    # =====================================================
+
+    elif "останні" in text:
+
+        update.message.reply_text(
+
+            get_last_trades(),
+
+            parse_mode="HTML",
+
+            reply_markup=reply_markup
+
+        )
+
+    # =====================================================
+
+    # PING
+
+    # =====================================================
+
+    elif "пінг" in text:
+
+        update.message.reply_text(
+
+            "🏓 Бот працює стабільно.",
+
+            reply_markup=reply_markup
+
+        )
+
+# =========================================================
+
+# 🔍 MARKET SCANNER
+
+# =========================================================
+
+def scan_market():
+
+    global daily_signals
+
+    last_reset = datetime.utcnow().date()
+
+    while True:
+
+        try:
+
+            today = datetime.utcnow().date()
+
+            if today != last_reset:
+
+                daily_signals = 0
+
+                last_reset = today
+
+            check_active_trades()
+
+            if daily_signals >= MAX_SIGNALS_PER_DAY:
+
+                time.sleep(300)
+
+                continue
+
+            markets = exchange.load_markets()
+
+            symbols = []
+
+            for symbol in markets:
+
+                if (
+
+                    "/USDT" in symbol and
+
+                    markets[symbol]["active"]
+
+                ):
+
+                    symbols.append(symbol)
+
+            for symbol in symbols:
+
+                try:
+
+                    signal = analyze_symbol(symbol)
+
+                    if signal:
+
+                        send_signal(signal)
+
+                    time.sleep(1)
+
+                except:
+
+                    pass
+
+            time.sleep(SCAN_DELAY)
+
+        except Exception as e:
+
+            print("SCAN ERROR:", e)
+
+            time.sleep(30)
+
+# =========================================================
+
+# 🚀 START BOT
+
+# =========================================================
+
+send_message(
+
+    "🚀 AEGIS ULTRA BOT STARTED"
+
+)
+
+dispatcher = updater.dispatcher
+
+dispatcher.add_handler(
+
+    MessageHandler(
+
+        Filters.text,
+
+        handle_message
+
+    )
+
+)
+
+updater.start_polling()
+
+# =========================================================
+
+# 🔥 START MARKET SCANNER
+
+# =========================================================
+
+scanner_thread = threading.Thread(
+
+    target=scan_market
+
+)
+
+scanner_thread.start()
+
+# =========================================================
+
+# ♾️ KEEP ALIVE
+
+# =========================================================
+
+while True:
+
+    time.sleep(60)
